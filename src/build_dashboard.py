@@ -257,12 +257,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h2>投注評估（紙上模擬） <span class="count">edge ≥ 3% 自動記一注・非投注建議</span></h2>
     <div class="disclaimer" id="betDisclaimer"></div>
     <div class="kpis" id="paperKpis"></div>
-    <h2>今日最大 edge 候選 <span class="count" id="candCount"></span></h2>
+
+    <h2>輸贏候選（獨贏） <span class="count" id="candMLCount"></span></h2>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>開賽</th><th>對戰</th><th>盤別</th><th>下注邊</th>
-          <th class="num">模型</th><th class="num">市場</th><th class="num">edge</th></tr></thead>
-        <tbody id="candBody"></tbody>
+        <thead><tr><th>開賽</th><th>對戰</th><th>下注邊</th>
+          <th class="num">模型勝率</th><th class="num">市場勝率</th><th class="num">edge</th></tr></thead>
+        <tbody id="candMLBody"></tbody>
+      </table>
+    </div>
+
+    <h2>比分候選（大小分） <span class="count" id="candTotalCount"></span></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>開賽</th><th>對戰</th><th>下注邊</th>
+          <th class="num">模型總分</th><th class="num">盤口線</th><th class="num">edge</th></tr></thead>
+        <tbody id="candTotalBody"></tbody>
       </table>
     </div>
   </div>
@@ -294,12 +304,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- 紙上下注紀錄（無盤口時隱藏）-->
   <div id="paperSection" style="display:none">
-    <h2>紙上下注紀錄 <span class="count" id="pbCount"></span></h2>
+    <h2>輸贏紀錄（獨贏） <span class="count" id="pbMLCount"></span></h2>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>日期</th><th>對戰</th><th>盤別</th><th>下注邊</th>
+        <thead><tr><th>日期</th><th>對戰</th><th>下注邊</th>
           <th class="num">edge</th><th class="num">結果(單位)</th><th class="num">CLV</th></tr></thead>
-        <tbody id="pbBody"></tbody>
+        <tbody id="pbMLBody"></tbody>
+      </table>
+    </div>
+
+    <h2>比分紀錄（大小分） <span class="count" id="pbTotalCount"></span></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>日期</th><th>對戰</th><th>下注邊</th>
+          <th class="num">edge</th><th class="num">結果(單位)</th><th class="num">CLV</th></tr></thead>
+        <tbody id="pbTotalBody"></tbody>
       </table>
     </div>
     <div class="note">CLV（收盤線價值）&gt; 0 = 你進場的線贏過收盤線，是長期有無 edge 最早的訊號。結果為每注 1 單位的淨利。</div>
@@ -415,47 +434,54 @@ if(DATA.has_market){
   }
   $("#paperKpis").innerHTML = paperTile("獨贏 ROI", P.ml) + paperTile("大小分 ROI", P.total);
 
-  // 今日最大 edge 候選
-  const C = DATA.edge_candidates || [];
-  $("#candCount").textContent = `${C.length} 筆`;
+  // ---- 候選：輸贏（獨贏）與 比分（大小分）各自一張表，各自照 edge 由大到小 ----
   const ctz = {timeZone:"Asia/Taipei", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"};
-  if(!C.length){ $("#candBody").innerHTML = `<tr><td colspan="7" class="empty">今天沒有超過門檻的 edge 候選。</td></tr>`; }
-  else $("#candBody").innerHTML = C.flatMap(g=>{
+  const C = DATA.edge_candidates || [];
+
+  const mlC = C.filter(g=>g.paper_ml_side).sort((a,b)=>b.edge_ml-a.edge_ml);
+  $("#candMLCount").textContent = `${mlC.length} 場`;
+  if(!mlC.length){ $("#candMLBody").innerHTML = `<tr><td colspan="6" class="empty">今天沒有超過門檻的獨贏 edge。</td></tr>`; }
+  else $("#candMLBody").innerHTML = mlC.map(g=>{
     const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
-    const rows=[];
-    if(g.paper_ml_side){
-      const sideAbbr = g.paper_ml_side==="home"?g.home_abbr:g.away_abbr;
-      const mp = g.paper_ml_side==="home"?g.market_p_home:1-g.market_p_home;
-      const modp = g.paper_ml_side==="home"?g.p_home_win:1-g.p_home_win;
-      rows.push(`<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td><td><span class="seg">獨贏</span></td>`+
-        `<td>${sideAbbr}</td><td class="num">${(modp*100).toFixed(0)}%</td><td class="num">${(mp*100).toFixed(0)}%</td>`+
-        `<td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td></tr>`);
-    }
-    if(g.paper_total_side){
-      const modp = g.paper_total_side==="over"?null:null;
-      rows.push(`<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td><td><span class="seg">大小分</span></td>`+
-        `<td>${g.paper_total_side==="over"?"大分 O":"小分 U"} ${g.market_total_line}</td>`+
-        `<td class="num">${Math.round(g.pred_total)}</td><td class="num">${g.market_total_line}</td>`+
-        `<td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td></tr>`);
-    }
-    return rows;
+    const sideAbbr = g.paper_ml_side==="home"?g.home_abbr:g.away_abbr;
+    const mp = g.paper_ml_side==="home"?g.market_p_home:1-g.market_p_home;
+    const modp = g.paper_ml_side==="home"?g.p_home_win:1-g.p_home_win;
+    return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
+      `<td><b>${sideAbbr}</b></td><td class="num">${(modp*100).toFixed(0)}%</td>`+
+      `<td class="num">${(mp*100).toFixed(0)}%</td><td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td></tr>`;
   }).join("");
 
-  // 紙上下注紀錄
+  const totC = C.filter(g=>g.paper_total_side).sort((a,b)=>b.edge_total-a.edge_total);
+  $("#candTotalCount").textContent = `${totC.length} 場`;
+  if(!totC.length){ $("#candTotalBody").innerHTML = `<tr><td colspan="6" class="empty">今天沒有超過門檻的大小分 edge。</td></tr>`; }
+  else $("#candTotalBody").innerHTML = totC.map(g=>{
+    const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
+    const sideTxt = g.paper_total_side==="over"?`大分 O ${g.market_total_line}`:`小分 U ${g.market_total_line}`;
+    return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
+      `<td><b>${sideTxt}</b></td><td class="num">${Math.round(g.pred_total)}</td>`+
+      `<td class="num">${g.market_total_line}</td><td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td></tr>`;
+  }).join("");
+
+  // ---- 紙上下注紀錄：同樣拆兩張表 ----
   const B = DATA.paper_bets || [];
-  $("#pbCount").textContent = `${B.length} 注`;
-  if(!B.length){ $("#pbBody").innerHTML = `<tr><td colspan="7" class="empty">還沒有已結算的紙上下注。</td></tr>`; }
-  else $("#pbBody").innerHTML = B.map(b=>{
+  function pbRow(b){
     const win = b.result>0, push = b.result===0;
     const resTxt = push?"退注":(win?"+"+b.result.toFixed(2):b.result.toFixed(2));
     const resCls = push?"":(win?"ok":"no");
     const clvTxt = b.clv==null?"—":(b.clv>=0?"+":"")+(b.clv*100).toFixed(1)+"pp";
     const clvCls = b.clv==null?"":(b.clv>=0?"ok":"no");
     const sideTxt = b.type==="大小分" ? (b.side==="over"?`大分 O${b.line??""}`:`小分 U${b.line??""}`) : b.side_abbr;
-    return `<tr><td>${b.date.slice(5)}</td><td>${b.matchup}</td><td><span class="seg">${b.type}</span></td>`+
-      `<td>${sideTxt}</td><td class="num">+${(b.edge*100).toFixed(1)}%</td>`+
+    return `<tr><td>${b.date.slice(5)}</td><td>${b.matchup}</td>`+
+      `<td><b>${sideTxt}</b></td><td class="num">+${(b.edge*100).toFixed(1)}%</td>`+
       `<td class="num ${resCls}">${resTxt}</td><td class="num ${clvCls}">${clvTxt}</td></tr>`;
-  }).join("");
+  }
+  const mlB = B.filter(b=>b.type==="獨贏"), totB = B.filter(b=>b.type==="大小分");
+  $("#pbMLCount").textContent = `${mlB.length} 注`;
+  $("#pbTotalCount").textContent = `${totB.length} 注`;
+  $("#pbMLBody").innerHTML = mlB.length ? mlB.map(pbRow).join("")
+    : `<tr><td colspan="6" class="empty">還沒有已結算的獨贏紙上下注。</td></tr>`;
+  $("#pbTotalBody").innerHTML = totB.length ? totB.map(pbRow).join("")
+    : `<tr><td colspan="6" class="empty">還沒有已結算的大小分紙上下注。</td></tr>`;
 }
 
 // ---- history table ----
