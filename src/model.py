@@ -1,28 +1,34 @@
 """
-Baseline 模型：勝負 + 總分（+ 分差，用來湊出預測比分）。
+Baseline 模型：總分 + 分差 → 一切從「分差」推導，三者永遠一致。
 
 刻意選穩健、不易過擬合的線性模型（樣本量只有數百場）：
-  - 勝負：LogisticRegression → 輸出主隊獲勝機率
+  - 分差：Ridge 回歸（home - away）—— 這是「單一真相來源」
   - 總分：Ridge 回歸
-  - 分差：Ridge 回歸（home - away），用來把總分拆成雙方預測分數
 
-用「時間序」評估：拿賽季後段當測試集，模擬真實上線時「只能用過去預測未來」。
-評估指標：勝負命中率、Brier score（機率校準）、總分 MAE。
+勝方、勝率、預測比分「全部」從分差推出來，所以不會再出現
+「比分看好 A、勝方卻寫 B」的矛盾：
+  - 預測比分：由總分與分差組回（home=(total+margin)/2, away=(total-margin)/2）
+  - 預測勝方：分差 >= 0 → 主隊，否則客隊（與比分方向一致）
+  - 主隊勝率：把分差套進常態分佈 —— P(主勝)=Φ(分差/σ)，σ 為分差殘差標準差
+    （分差 0 → 50%；分差越大、勝率越偏一邊，且必與勝方同側）
 
-之後要升級（加傷兵、球員數據、換 XGBoost），只要換這支檔案的模型即可，
-輸入輸出介面（fit / predict_games）保持不變，其他模組不受影響。
+用「時間序」評估：拿賽季後段當測試集，模擬真實上線「只能用過去預測未來」。
+之後要升級（加傷兵、球員數據、換 XGBoost），只要換這支檔案，介面不變。
 """
 from __future__ import annotations
 
+import math
 import pickle
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, brier_score_loss, mean_absolute_error
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+
+_erf = np.vectorize(math.erf)
 
 from features import FEATURE_COLS, build_feature_table
 
@@ -31,38 +37,49 @@ MODEL_PATH = Path(__file__).resolve().parent.parent / "data" / "model.pkl"
 
 class WNBAModel:
     def __init__(self):
-        self.clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, C=0.5))
         self.reg_total = make_pipeline(StandardScaler(), Ridge(alpha=5.0))
         self.reg_margin = make_pipeline(StandardScaler(), Ridge(alpha=5.0))
-        self.baseline_total = 160.0  # 無資料時的退路
+        self.baseline_total = 160.0   # 無資料時的退路
+        self.margin_sigma = 13.0      # 分差殘差標準差（WNBA 典型 ~13），fit 後更新
 
     def fit(self, feat_df: pd.DataFrame):
         d = feat_df[feat_df["completed"]].dropna(subset=FEATURE_COLS + ["winner", "total", "margin"])
         X = d[FEATURE_COLS].values
-        y_win = (d["winner"] == "home").astype(int).values
-        self.clf.fit(X, y_win)
         self.reg_total.fit(X, d["total"].values)
         self.reg_margin.fit(X, d["margin"].values)
+        # 分差預測誤差的標準差 → 把「分差」轉成「勝率」時的分佈寬度
+        resid = d["margin"].values - self.reg_margin.predict(X)
+        self.margin_sigma = max(float(np.std(resid)), 6.0)
         self.baseline_total = float(d["total"].mean())
         return self
 
     def predict_games(self, feat_df: pd.DataFrame) -> pd.DataFrame:
         d = feat_df.copy()
         X = d[FEATURE_COLS].values
-        p_home = self.clf.predict_proba(X)[:, 1]
         total = self.reg_total.predict(X)
-        margin = self.reg_margin.predict(X)
+        margin = self.reg_margin.predict(X)          # 單一真相來源（home - away）
+
+        # 主隊勝率：分差套常態分佈，與分差同號 → 必與勝方、比分一致
+        p_home = 0.5 * (1.0 + _erf(margin / (self.margin_sigma * math.sqrt(2.0))))
+
+        home = np.rint((total + margin) / 2).astype(int)
+        away = np.rint((total - margin) / 2).astype(int)
+        # 消除四捨五入造成的平手，讓「看得到的比分」與勝方方向一致
+        tie = home == away
+        home = np.where(tie & (margin >= 0), home + 1, home)
+        away = np.where(tie & (margin < 0), away + 1, away)
+
         out = pd.DataFrame({
             "game_id": d["game_id"].values,
             "p_home_win": p_home,
             "pred_total": total,
             "pred_margin": margin,
+            "pred_home_score": home,
+            "pred_away_score": away,
         })
-        out["pred_winner"] = np.where(out["p_home_win"] >= 0.5, "home", "away")
-        out["pred_home_score"] = np.rint((total + margin) / 2).astype(int)
-        out["pred_away_score"] = np.rint((total - margin) / 2).astype(int)
+        out["pred_winner"] = np.where(margin >= 0, "home", "away")
         # 信心度 = 距離 50% 多遠，映射到 0~100
-        out["confidence"] = (np.abs(out["p_home_win"] - 0.5) * 200).round(0).astype(int)
+        out["confidence"] = (np.abs(p_home - 0.5) * 200).round(0).astype(int)
         return out
 
     def save(self, path: Path = MODEL_PATH):

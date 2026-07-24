@@ -3,11 +3,16 @@
 
 流程：
   1. 下載最新賽程與比分
-  2. 重訓模型
-  3. 補撿：把已完賽卻還沒記錄的本季比賽補進歷史（關掉邊界漏接漏洞）
-  4. 對未來比賽產生/更新賽前預測快照
-  5. 結算已完賽比賽
+  2. 重訓模型（資料每天都在變，重訓成本很低）
+  3. 回填歷史（僅第一次需要，用來把過去賽事的賽前預測補進 DB）
+  4. 對未完賽比賽產生賽前預測快照（已存在的不覆蓋）
+  5. 結算已完賽比賽（補上實際結果與誤差）
   6. 產生每日儀表板 HTML
+
+排程建議：
+  早上跑一次（產生今日/未來預測）＋ 每晚跑一次（結算當天結果）。
+  用法： python src/run_daily.py            # 每日更新
+        python src/run_daily.py --backfill # 首次執行，含歷史回填
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ SEASONS = [2023, 2024, 2025, 2026]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backfill", action="store_true", help="（保留參數，現在每次都會自動補撿）")
+    ap.add_argument("--backfill", action="store_true", help="首次執行：回填本季歷史預測")
     ap.add_argument("--no-download", action="store_true", help="用本地已下載的資料，不重新下載")
     args = ap.parse_args()
 
@@ -47,14 +52,18 @@ def main():
     model.save()
 
     # 每次都做「補撿」：把已完賽、卻還沒進資料庫的本季比賽用 walk-forward 補上歷史。
-    # 這關掉了「部署當下已打完的比賽會漏接」的邊界漏洞。backfill_history 只寫『尚未存在』
-    # 的比賽，所以是冪等的、不會覆蓋任何已存在的真實賽前快照。
+    # 這關掉了「部署當下已打完的比賽會漏接」的邊界漏洞——不管什麼原因漏掉，
+    # 下一次排程就會自動補回來。backfill_history 只寫『尚未存在』的比賽，所以是冪等的、
+    # 不會覆蓋任何已經存在的真實賽前快照。
     latest_season = int(games["season"].max())
     print(f"3) 補撿本季({latest_season})已完賽但未記錄的比賽 ...")
     n_bf = backfill_history(games, model, season=latest_season)
     print(f"   補撿 {n_bf} 場")
 
     print("4) 產生/更新未來賽事預測（每日重算，開賽後不再改）...")
+    # refresh=True：每天用最新近況重算所有『尚未開賽』的比賽，讓預測隨時間演化。
+    # 已開賽/已結算的比賽不會被覆蓋（SQL 只更新 status='pending' 且 generate 只挑 date>=now），
+    # 所以每場比賽在「開賽前最後一次」的預測會自然成為永久紀錄拿去跟實際比對。
     n_pred = generate_predictions(games, model, refresh=True)
     print(f"   更新 {n_pred} 場未來預測")
 
