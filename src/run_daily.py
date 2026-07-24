@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_dashboard import build_dashboard
 from fetch import load_games
 from features import build_feature_table
+from market import settle_market, update_market
 from model import WNBAModel, time_series_eval
 from predict import backfill_history, generate_predictions, purge_stale_pending
 from settle import settle_results
@@ -67,10 +68,15 @@ def main():
     n_pred = generate_predictions(games, model, refresh=True)
     print(f"   更新 {n_pred} 場未來預測")
 
+    print("4.5) 撈市場盤口、算 edge、記紙上下注 ...")
+    mk = update_market(model)
+    print(f"   對上 {mk['matched']} 場，自動記注：獨贏 {mk['flagged_ml']}、大小分 {mk['flagged_total']}")
+
     print("5) 結算已完賽比賽 ...")
     n_settle = settle_results(games)
+    n_clv = settle_market()
     n_purge = purge_stale_pending()
-    print(f"   結算 {n_settle} 場，清除殘留延賽 {n_purge} 場")
+    print(f"   結算 {n_settle} 場、算 CLV/損益 {n_clv} 場，清除殘留延賽 {n_purge} 場")
 
     print("6) 產生儀表板 ...")
     out = build_dashboard()

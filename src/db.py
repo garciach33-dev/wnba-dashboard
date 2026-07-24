@@ -53,12 +53,50 @@ CREATE INDEX IF NOT EXISTS idx_pred_date ON predictions(game_date);
 CREATE INDEX IF NOT EXISTS idx_pred_status ON predictions(status);
 """
 
+# 盤口 / edge / CLV / 紙上下注欄位（後加）。用 ALTER TABLE 逐欄補上，
+# 讓既有資料庫能就地升級、不必砍掉重建。
+MARKET_COLUMNS = {
+    # 進場盤口（第一次看到就凍結，代表「我們下注時拿到的線」）
+    "market_captured_at": "TEXT",
+    "market_n_books": "INTEGER",
+    "market_p_home": "REAL",      # 去水錢後市場主隊勝率
+    "market_dec_home": "REAL",    # 主隊十進位賠率
+    "market_dec_away": "REAL",
+    "market_total_line": "REAL",  # 大小分盤口線
+    "market_dec_over": "REAL",
+    "market_dec_under": "REAL",
+    "market_p_over": "REAL",      # 去水錢後市場「過盤」機率
+    # 收盤線（每次排程對未開賽比賽刷新，開賽即凍結）→ 用來算 CLV
+    "closing_p_home": "REAL",
+    "closing_p_over": "REAL",
+    "closing_total_line": "REAL",
+    # 模型 vs 市場的 edge（進場當下）
+    "edge_ml": "REAL",
+    "edge_total": "REAL",
+    # 自動紙上下注（edge 超門檻才記）與結算結果
+    "paper_ml_side": "TEXT",      # 'home'/'away'，模型看好且有 edge 的一邊
+    "paper_ml_result": "REAL",    # 單位淨利（+賠率-1 / -1）
+    "clv_ml": "REAL",             # 收盤機率 - 進場機率（同側），>0 = 贏過收盤線
+    "paper_total_side": "TEXT",   # 'over'/'under'
+    "paper_total_result": "REAL",
+    "clv_total": "REAL",
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection):
+    have = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
+    for col, typ in MARKET_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
+    conn.commit()
+
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
     return conn
 
 

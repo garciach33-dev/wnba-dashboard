@@ -59,16 +59,82 @@ def gather_data() -> dict:
         trend.append({"date": chron[i]["game_date"][:10], "acc": round(hr, 3)})
     trend = trend[-40:]
 
+    paper = _paper_stats(settled)
+    has_market = any(r.get("market_captured_at") for r in pending) or paper["ml"]["n"] or paper["total"]["n"]
+
+    # 今日/未來的「最大 edge 候選」（有被自動記注的場次，依 edge 由大到小）
+    cands = []
+    for r in pending:
+        best = max(r.get("edge_ml") or 0, r.get("edge_total") or 0)
+        if r.get("paper_ml_side") or r.get("paper_total_side"):
+            cands.append({**r, "_best_edge": best})
+    cands.sort(key=lambda r: r["_best_edge"], reverse=True)
+
+    # 已結算的紙上下注紀錄
+    paper_bets = _paper_bet_rows(settled)
+
     return {
         "generated_at": now.isoformat(),
         "metrics": {
             "acc": acc, "total_mae": total_mae, "margin_mae": margin_mae,
             "brier": brier, "n_settled": n, "n_pending": len(pending),
         },
+        "has_market": bool(has_market),
+        "paper": paper,
+        "edge_candidates": cands,
+        "paper_bets": paper_bets,
         "pending": pending,
         "settled": settled,
         "trend": trend,
     }
+
+
+def _agg(bets, result_key, clv_key):
+    n = len(bets)
+    if not n:
+        return {"n": 0, "hit_rate": None, "roi": None, "units": 0.0,
+                "avg_clv": None, "pct_pos_clv": None}
+    units = sum(b[result_key] for b in bets)
+    wins = sum(1 for b in bets if b[result_key] > 0)
+    clvs = [b[clv_key] for b in bets if b[clv_key] is not None]
+    return {
+        "n": n,
+        "hit_rate": wins / n,
+        "roi": units / n,                       # 每注平均淨利（單位）
+        "units": units,
+        "avg_clv": (sum(clvs) / len(clvs)) if clvs else None,
+        "pct_pos_clv": (sum(1 for c in clvs if c > 0) / len(clvs)) if clvs else None,
+    }
+
+
+def _paper_stats(settled) -> dict:
+    ml = [r for r in settled if r.get("paper_ml_side") and r.get("paper_ml_result") is not None]
+    tot = [r for r in settled if r.get("paper_total_side") and r.get("paper_total_result") is not None]
+    return {
+        "ml": _agg(ml, "paper_ml_result", "clv_ml"),
+        "total": _agg(tot, "paper_total_result", "clv_total"),
+    }
+
+
+def _paper_bet_rows(settled) -> list:
+    rows = []
+    for r in sorted(settled, key=lambda x: x["game_date"], reverse=True):
+        if r.get("paper_ml_side") and r.get("paper_ml_result") is not None:
+            rows.append({
+                "date": r["game_date"][:10], "matchup": f'{r["away_abbr"]} @ {r["home_abbr"]}',
+                "type": "獨贏", "side": r["paper_ml_side"],
+                "side_abbr": r["home_abbr"] if r["paper_ml_side"] == "home" else r["away_abbr"],
+                "edge": r.get("edge_ml"), "result": r["paper_ml_result"], "clv": r.get("clv_ml"),
+            })
+        if r.get("paper_total_side") and r.get("paper_total_result") is not None:
+            rows.append({
+                "date": r["game_date"][:10], "matchup": f'{r["away_abbr"]} @ {r["home_abbr"]}',
+                "type": "大小分", "side": r["paper_total_side"],
+                "side_abbr": ("over" if r["paper_total_side"] == "over" else "under"),
+                "line": r.get("market_total_line"),
+                "edge": r.get("edge_total"), "result": r["paper_total_result"], "clv": r.get("clv_total"),
+            })
+    return rows
 
 
 def build_dashboard(out: Path = OUT_PATH) -> Path:
@@ -159,6 +225,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     transition:opacity .1s;box-shadow:0 4px 14px rgba(0,0,0,.12);z-index:9}
   .empty{color:var(--muted);font-size:13px;padding:14px 2px}
   .note{font-size:11px;color:var(--muted);margin-top:8px}
+  /* betting */
+  .mkt-row{display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary);
+    margin-top:8px;padding-top:8px;border-top:1px dashed var(--grid);font-variant-numeric:tabular-nums}
+  .edge{font-weight:650}
+  .edge.pos{color:var(--good)} .edge.neg{color:var(--muted)}
+  .badge{display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:99px;
+    background:var(--series-1);color:#fff;margin-left:6px;vertical-align:middle}
+  .kpi .val.pos{color:var(--good)} .kpi .val.neg{color:var(--bad)}
+  .disclaimer{font-size:12px;color:var(--text-secondary);background:var(--chip);border:1px solid var(--border);
+    border-radius:10px;padding:10px 14px;margin:0 0 14px;line-height:1.6}
+  .seg{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;background:var(--chip);
+    color:var(--text-secondary);margin-right:6px}
   footer{margin-top:40px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:14px}
 </style>
 </head>
@@ -173,6 +251,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="sub" id="subtitle"></div>
 
   <div class="kpis" id="kpis"></div>
+
+  <!-- 投注評估區（無盤口時整段隱藏）-->
+  <div id="betting" style="display:none">
+    <h2>投注評估（紙上模擬） <span class="count">edge ≥ 3% 自動記一注・非投注建議</span></h2>
+    <div class="disclaimer" id="betDisclaimer"></div>
+    <div class="kpis" id="paperKpis"></div>
+    <h2>今日最大 edge 候選 <span class="count" id="candCount"></span></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>開賽</th><th>對戰</th><th>盤別</th><th>下注邊</th>
+          <th class="num">模型</th><th class="num">市場</th><th class="num">edge</th></tr></thead>
+        <tbody id="candBody"></tbody>
+      </table>
+    </div>
+  </div>
 
   <h2>今日 / 未來賽事 <span class="count" id="pendCount"></span></h2>
   <div class="cards" id="pending"></div>
@@ -197,6 +290,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </tr></thead>
       <tbody id="histBody"></tbody>
     </table>
+  </div>
+
+  <!-- 紙上下注紀錄（無盤口時隱藏）-->
+  <div id="paperSection" style="display:none">
+    <h2>紙上下注紀錄 <span class="count" id="pbCount"></span></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>日期</th><th>對戰</th><th>盤別</th><th>下注邊</th>
+          <th class="num">edge</th><th class="num">結果(單位)</th><th class="num">CLV</th></tr></thead>
+        <tbody id="pbBody"></tbody>
+      </table>
+    </div>
+    <div class="note">CLV（收盤線價值）&gt; 0 = 你進場的線贏過收盤線，是長期有無 edge 最早的訊號。結果為每注 1 單位的淨利。</div>
   </div>
 
   <footer id="foot"></footer>
@@ -259,7 +365,96 @@ else {
         <div class="prob-txt">${pickAbbr} 勝率 ${(pShown*100).toFixed(0)}%</div>
       </div>
       <span class="pick">預測勝方：${pickAbbr}　預測總分 ${Math.round(g.pred_total)}　信心 ${g.confidence}</span>
+      ${marketRows(g)}
     </div>`;
+  }).join("");
+}
+
+// 卡片內的市場對照（有盤口才顯示）
+function marketRows(g){
+  if(g.market_p_home==null && g.market_total_line==null) return "";
+  let html = "";
+  if(g.market_p_home!=null){
+    const mShown = g.pred_winner==="home" ? g.market_p_home : 1-g.market_p_home;
+    const e = g.edge_ml, flagged = !!g.paper_ml_side;
+    html += `<div class="mkt-row"><span>獨贏　模型 ${(pShown0(g))}% ・ 市場 ${(mShown*100).toFixed(0)}%</span>`+
+      `<span class="edge ${flagged?'pos':'neg'}">edge ${e==null?'—':(e>=0?'+':'')+(e*100).toFixed(1)+'%'}`+
+      `${flagged?'<span class="badge">候選</span>':''}</span></div>`;
+  }
+  if(g.market_total_line!=null){
+    const pOver = g.pred_total!=null && g.market_p_over!=null ? null : null;
+    const side = g.paper_total_side;
+    const e = g.edge_total, flagged = !!side;
+    const sideTxt = side ? (side==="over"?"大分":"小分") : (g.pred_total>g.market_total_line?"偏大":"偏小");
+    html += `<div class="mkt-row"><span>大小分　盤口 ${g.market_total_line} ・ 模型 ${Math.round(g.pred_total)}（${sideTxt}）</span>`+
+      `<span class="edge ${flagged?'pos':'neg'}">edge ${e==null?'—':(e>=0?'+':'')+(e*100).toFixed(1)+'%'}`+
+      `${flagged?'<span class="badge">候選</span>':''}</span></div>`;
+  }
+  return html;
+}
+function pST(g){ return g.pred_winner==="home" ? g.p_home_win : 1-g.p_home_win; }
+function pShown0(g){ return (pST(g)*100).toFixed(0); }
+
+// ---- 投注評估區 ----
+if(DATA.has_market){
+  $("#betting").style.display = "";
+  $("#paperSection").style.display = "";
+  $("#betDisclaimer").innerHTML =
+    "參考基準為<b>國際盤共識</b>（多家博彩商去水錢後的中位數），非台灣運彩線——運彩通常更差，"+
+    "所以這是偏寬鬆的照妖鏡。以下為<b>紙上模擬、非投注建議</b>：系統把「模型看好且贏過市場 ≥3%」的場次自動記為 1 單位下注，"+
+    "用來評估你到底有沒有 edge。<b>CLV（贏過收盤線）比損益更早、更可信</b>——樣本要夠大才有意義。";
+  const P = DATA.paper;
+  function paperTile(label, a){
+    const roi = a.roi==null?null:a.roi*100;
+    const roiCls = roi==null?"":(roi>=0?"pos":"neg");
+    return `<div class="kpi"><div class="label">${label}（${a.n} 注）</div>`+
+      `<div class="val ${roiCls}">${roi==null?"—":(roi>=0?"+":"")+roi.toFixed(1)+"%"}</div>`+
+      `<div class="hint">命中 ${a.hit_rate==null?"—":(a.hit_rate*100).toFixed(0)+"%"}`+
+      ` ・ 贏過收盤 ${a.pct_pos_clv==null?"—":(a.pct_pos_clv*100).toFixed(0)+"%"}`+
+      ` ・ 平均CLV ${a.avg_clv==null?"—":(a.avg_clv>=0?"+":"")+(a.avg_clv*100).toFixed(1)+"pp"}</div></div>`;
+  }
+  $("#paperKpis").innerHTML = paperTile("獨贏 ROI", P.ml) + paperTile("大小分 ROI", P.total);
+
+  // 今日最大 edge 候選
+  const C = DATA.edge_candidates || [];
+  $("#candCount").textContent = `${C.length} 筆`;
+  const ctz = {timeZone:"Asia/Taipei", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"};
+  if(!C.length){ $("#candBody").innerHTML = `<tr><td colspan="7" class="empty">今天沒有超過門檻的 edge 候選。</td></tr>`; }
+  else $("#candBody").innerHTML = C.flatMap(g=>{
+    const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
+    const rows=[];
+    if(g.paper_ml_side){
+      const sideAbbr = g.paper_ml_side==="home"?g.home_abbr:g.away_abbr;
+      const mp = g.paper_ml_side==="home"?g.market_p_home:1-g.market_p_home;
+      const modp = g.paper_ml_side==="home"?g.p_home_win:1-g.p_home_win;
+      rows.push(`<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td><td><span class="seg">獨贏</span></td>`+
+        `<td>${sideAbbr}</td><td class="num">${(modp*100).toFixed(0)}%</td><td class="num">${(mp*100).toFixed(0)}%</td>`+
+        `<td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td></tr>`);
+    }
+    if(g.paper_total_side){
+      const modp = g.paper_total_side==="over"?null:null;
+      rows.push(`<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td><td><span class="seg">大小分</span></td>`+
+        `<td>${g.paper_total_side==="over"?"大分 O":"小分 U"} ${g.market_total_line}</td>`+
+        `<td class="num">${Math.round(g.pred_total)}</td><td class="num">${g.market_total_line}</td>`+
+        `<td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td></tr>`);
+    }
+    return rows;
+  }).join("");
+
+  // 紙上下注紀錄
+  const B = DATA.paper_bets || [];
+  $("#pbCount").textContent = `${B.length} 注`;
+  if(!B.length){ $("#pbBody").innerHTML = `<tr><td colspan="7" class="empty">還沒有已結算的紙上下注。</td></tr>`; }
+  else $("#pbBody").innerHTML = B.map(b=>{
+    const win = b.result>0, push = b.result===0;
+    const resTxt = push?"退注":(win?"+"+b.result.toFixed(2):b.result.toFixed(2));
+    const resCls = push?"":(win?"ok":"no");
+    const clvTxt = b.clv==null?"—":(b.clv>=0?"+":"")+(b.clv*100).toFixed(1)+"pp";
+    const clvCls = b.clv==null?"":(b.clv>=0?"ok":"no");
+    const sideTxt = b.type==="大小分" ? (b.side==="over"?`大分 O${b.line??""}`:`小分 U${b.line??""}`) : b.side_abbr;
+    return `<tr><td>${b.date.slice(5)}</td><td>${b.matchup}</td><td><span class="seg">${b.type}</span></td>`+
+      `<td>${sideTxt}</td><td class="num">+${(b.edge*100).toFixed(1)}%</td>`+
+      `<td class="num ${resCls}">${resTxt}</td><td class="num ${clvCls}">${clvTxt}</td></tr>`;
   }).join("");
 }
 

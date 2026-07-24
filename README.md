@@ -90,6 +90,24 @@ SQL 更新只作用在 `status='pending'` 的列，所以已開賽/已結算的�
 > 首次若想重跑歷史回填：本機執行 `python src/run_daily.py --backfill` 後把 `data/wnba.db` commit 上去即可。
 > 純本機排程也行：用 cron 跑 `python src/run_daily.py`（UTC 時間）。
 
+## 盤口 / 投注評估（選用）
+
+接上 [The Odds API](https://the-odds-api.com/) 的免費盤口後，儀表板會多出投注評估區：
+每場比對「模型機率 vs 國際盤共識機率」、列出今日最大 edge 候選、並對
+「edge ≥ 3%」的場次自動記紙上下注，追蹤 CLV（收盤線價值）、命中率與 ROI。
+
+啟用方式：
+1. 到 the-odds-api.com 申請免費 API key。
+2. GitHub repo → Settings → Secrets and variables → Actions → New repository secret，
+   名稱 `ODDS_API_KEY`、值填你的金鑰。
+3. workflow 已把該 secret 以環境變數傳入（見 `.github/workflows/daily.yml`）。
+
+沒設金鑰也完全正常：系統自動略過盤口、投注區隱藏，其餘照跑。
+
+重要觀念：參考基準是國際盤，不是台灣運彩（運彩沒有 API，且線通常更差），
+所以這是偏寬鬆的照妖鏡。CLV 比損益更早、更可信地告訴你有沒有 edge。
+此為分析工具、非投注建議，投注長期為負期望、有輸錢風險。
+
 ## 下一步可以加的東西
 
 球員層級數據與傷兵名單（目前最缺、最能提升準度的一塊）、主客場分開的攻防評分、

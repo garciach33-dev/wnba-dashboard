@@ -41,17 +41,23 @@ class WNBAModel:
         self.reg_margin = make_pipeline(StandardScaler(), Ridge(alpha=5.0))
         self.baseline_total = 160.0   # 無資料時的退路
         self.margin_sigma = 13.0      # 分差殘差標準差（WNBA 典型 ~13），fit 後更新
+        self.total_sigma = 15.0       # 總分殘差標準差，用來把「預測總分」轉成「過盤機率」
 
     def fit(self, feat_df: pd.DataFrame):
         d = feat_df[feat_df["completed"]].dropna(subset=FEATURE_COLS + ["winner", "total", "margin"])
         X = d[FEATURE_COLS].values
         self.reg_total.fit(X, d["total"].values)
         self.reg_margin.fit(X, d["margin"].values)
-        # 分差預測誤差的標準差 → 把「分差」轉成「勝率」時的分佈寬度
-        resid = d["margin"].values - self.reg_margin.predict(X)
-        self.margin_sigma = max(float(np.std(resid)), 6.0)
+        # 殘差標準差 → 把點估計（分差/總分）轉成機率時的分佈寬度
+        self.margin_sigma = max(float(np.std(d["margin"].values - self.reg_margin.predict(X))), 6.0)
+        self.total_sigma = max(float(np.std(d["total"].values - self.reg_total.predict(X))), 6.0)
         self.baseline_total = float(d["total"].mean())
         return self
+
+    def prob_over(self, model_total, line):
+        """模型認為『實際總分 > 盤口線』的機率 = Φ((預測總分 - 線)/σ)。"""
+        z = (np.asarray(model_total, dtype=float) - np.asarray(line, dtype=float)) / (self.total_sigma * math.sqrt(2.0))
+        return 0.5 * (1.0 + _erf(z))
 
     def predict_games(self, feat_df: pd.DataFrame) -> pd.DataFrame:
         d = feat_df.copy()
