@@ -11,13 +11,131 @@
 """
 from __future__ import annotations
 
+import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from db import connect
 
 OUT_PATH = Path(__file__).resolve().parent.parent / "dashboard.html"
+MYBETS_CSV = Path(__file__).resolve().parent.parent / "data" / "my_bets.csv"
+TPE = timezone(timedelta(hours=8))   # 台北固定 UTC+8（無日光節約）
+
+
+def _taipei_date(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone(TPE).strftime("%Y-%m-%d")
+    except Exception:
+        return (iso or "")[:10]
+
+
+def load_mybets(conn) -> tuple[list, dict | None]:
+    """
+    讀 data/my_bets.csv（跨裝置：存在 repo，任何裝置打開網站都看得到），
+    對上 predictions 的比賽，算出你的損益、模型看法、以及「誰對」。
+    CSV 欄位：date(YYYY-MM-DD,台北),away,home,market(ML/OU),side,stake,odds,line
+    """
+    if not MYBETS_CSV.exists():
+        return [], None
+
+    # 建立 (away,home,台北日期) -> 比賽 的查表
+    rows = conn.execute("SELECT * FROM predictions").fetchall()
+    index = {}
+    for r in rows:
+        key = (r["away_abbr"].upper(), r["home_abbr"].upper(), _taipei_date(r["game_date"]))
+        index[key] = dict(r)
+
+    out = []
+    with open(MYBETS_CSV, newline="", encoding="utf-8-sig") as f:
+        for raw in csv.DictReader(f):
+            try:
+                date = (raw.get("date") or "").strip()[:10]
+                away = (raw.get("away") or "").strip().upper()
+                home = (raw.get("home") or "").strip().upper()
+                market = (raw.get("market") or "").strip().upper()
+                side = (raw.get("side") or "").strip()
+                stake = float(raw.get("stake"))
+                odds = float(raw.get("odds"))
+                line = raw.get("line")
+                line = float(line) if (line not in (None, "",) ) else None
+            except (TypeError, ValueError):
+                continue
+            market = "OU" if market in ("OU", "TOTAL", "TOTALS", "大小分", "TOT") else "ML"
+
+            g = index.get((away, home, date))
+            base = {"date": date[5:], "matchup": f"{away}@{home}",
+                    "stake": stake, "odds": odds, "pnl": None, "agree": None,
+                    "who": None, "model_side": "—", "status": "無法對應"}
+            if not g:
+                base["target_label"] = side
+                out.append(base); continue
+
+            completed = g["status"] == "final" and g["actual_winner"] is not None
+            if market == "ML":
+                su = side.upper()
+                my = "home" if su in (home, "HOME", "H") else ("away" if su in (away, "AWAY", "A") else None)
+                if my is None:
+                    base["target_label"] = side; out.append(base); continue
+                my_abbr = home if my == "home" else away
+                mSide = "home" if (g["p_home_win"] is not None and g["p_home_win"] >= 0.5) else "away"
+                base["target_label"] = f"{my_abbr} 獨贏"
+                base["model_side"] = (home if mSide == "home" else away) + " 贏"
+                base["agree"] = (my == mSide)
+                if completed:
+                    yw = (my == g["actual_winner"]); mw = (mSide == g["actual_winner"])
+                    base["status"] = "贏" if yw else "輸"
+                    base["pnl"] = stake * (odds - 1) if yw else -stake
+                    base["who"] = "both" if (yw and mw) else "neither" if (not yw and not mw) else ("you" if yw else "model")
+                    base["_yw"], base["_mw"] = yw, mw
+                else:
+                    base["status"] = "待開賽"
+            else:  # OU
+                su = side.lower()
+                my = "over" if su in ("over", "o", "大", "大分") else ("under" if su in ("under", "u", "小", "小分") else None)
+                if my is None or line is None:
+                    base["target_label"] = (side or "大小分") + (f" {line}" if line is not None else "")
+                    base["status"] = "缺盤口線" if line is None else "無法對應"
+                    out.append(base); continue
+                mSide = "over" if (g["pred_total"] is not None and g["pred_total"] > line) else "under"
+                base["target_label"] = ("大分 O" if my == "over" else "小分 U") + f" {line:g}"
+                base["model_side"] = "大分" if mSide == "over" else "小分"
+                base["agree"] = (my == mSide)
+                at = g["actual_total"]
+                if completed and at is not None:
+                    if at == line:
+                        base["status"] = "退注"; base["pnl"] = 0.0
+                    else:
+                        ow = at > line
+                        yw = (my == "over" and ow) or (my == "under" and not ow)
+                        mw = (mSide == "over" and ow) or (mSide == "under" and not ow)
+                        base["status"] = "贏" if yw else "輸"
+                        base["pnl"] = stake * (odds - 1) if yw else -stake
+                        base["who"] = "both" if (yw and mw) else "neither" if (not yw and not mw) else ("you" if yw else "model")
+                        base["_yw"], base["_mw"] = yw, mw
+                else:
+                    base["status"] = "待開賽"
+            out.append(base)
+
+    # 統計（只算有勝負的注：排除待開賽與退注）
+    decided = [b for b in out if "_yw" in b]
+    stats = None
+    if out:
+        n = len(decided)
+        staked = sum(b["stake"] for b in decided)
+        pnl = sum(b["pnl"] for b in decided if b["pnl"] is not None)
+        stats = {
+            "n": len(out), "n_settled": n,
+            "pnl": pnl, "staked": staked,
+            "roi": (pnl / staked) if staked else 0.0,
+            "you_hits": sum(1 for b in decided if b.get("_yw")),
+            "model_hits": sum(1 for b in decided if b.get("_mw")),
+        }
+    for b in out:
+        b.pop("_yw", None); b.pop("_mw", None)
+    # 依日期新到舊
+    out.sort(key=lambda b: b["date"], reverse=True)
+    return out, stats
 
 
 def _rows(conn, where, order):
@@ -31,6 +149,7 @@ def gather_data() -> dict:
 
     pending = _rows(conn, "status='pending'", "game_date ASC")
     settled = _rows(conn, "status='final'", "game_date DESC")
+    mybets, mybets_stats = load_mybets(conn)
     conn.close()
 
     # 整體指標
@@ -81,6 +200,8 @@ def gather_data() -> dict:
         },
         "has_market": bool(has_market),
         "paper": paper,
+        "mybets": mybets,
+        "mybets_stats": mybets_stats,
         "edge_candidates": cands,
         "paper_bets": paper_bets,
         "pending": pending,
@@ -251,6 +372,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .decision.stop{background:rgba(208,59,59,.10)}
   .decision.go{background:rgba(12,163,12,.10)}
   .jhint{font-size:11px;color:var(--muted);margin-top:2px}
+  /* 我的下注（localStorage） */
+  .mybet{margin-top:10px;padding-top:8px;border-top:1px dashed var(--grid)}
+  .mybet-toggle{background:none;border:1px dashed var(--border);color:var(--text-secondary);
+    border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;width:100%}
+  .mybet-form{display:none;margin-top:8px;gap:6px;flex-wrap:wrap;align-items:center}
+  .mybet-form.show{display:flex}
+  .mybet-form select,.mybet-form input{font-size:12px;padding:5px 6px;border:1px solid var(--border);
+    border-radius:6px;background:var(--surface-1);color:var(--text-primary)}
+  .mybet-form input{width:62px}
+  .mybet-save{background:var(--series-1);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer}
+  .mybet-chip{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;
+    background:var(--chip);border-radius:8px;padding:5px 10px;margin-top:6px;font-variant-numeric:tabular-nums}
+  .mybet-chip .del{color:var(--bad);cursor:pointer;font-size:16px;line-height:1;border:none;background:none;padding:0 2px}
+  .mb-export{background:none;border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;margin-left:6px}
   footer{margin-top:40px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:14px}
 </style>
 </head>
@@ -339,6 +475,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="note">CLV（收盤線價值）&gt; 0 = 你進場的線贏過收盤線，是長期有無 edge 最早的訊號。結果為每注 1 單位的淨利。</div>
   </div>
+
+  <!-- 我的下注紀錄（跨裝置：來自 repo 的 data/my_bets.csv）-->
+  <h2>我的下注紀錄 <span class="count" id="mbCount"></span></h2>
+  <div class="kpis" id="mbKpis"></div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>日期</th><th>對戰</th><th>我的標的</th><th class="num">注額</th>
+        <th class="num">賠率</th><th>模型看法</th><th>誰對</th><th class="num">損益</th></tr></thead>
+      <tbody id="mbBody"></tbody>
+    </table>
+  </div>
+  <div class="note" id="mbNote"></div>
 
   <footer id="foot"></footer>
 </div>
@@ -546,6 +694,50 @@ if(DATA.has_market){
   $("#pbTotalBody").innerHTML = totB.length ? totB.map(pbRow).join("")
     : `<tr><td colspan="6" class="empty">還沒有已結算的大小分紙上下注。</td></tr>`;
 }
+
+// ==== 我的下注紀錄（跨裝置：從 repo 的 data/my_bets.csv 讀，伺服器端算好）＋ 與模型比對 ====
+(function(){
+  const M = DATA.mybets || [];
+  const S = DATA.mybets_stats || null;
+  $("#mbCount").textContent = `${M.length} 注`;
+  const tile=(label,val,cls,hint)=>`<div class="kpi"><div class="label">${label}</div>`+
+    `<div class="val ${cls||''}">${val}</div><div class="hint">${hint||''}</div></div>`;
+  if(!S || !S.n_settled){
+    $("#mbKpis").innerHTML = tile("尚無已結算下注","—","", M.length?"比賽打完後才有統計":"還沒有任何記錄");
+  } else {
+    const roi=S.roi;
+    $("#mbKpis").innerHTML =
+      tile("淨損益（依你的賠率）", (S.pnl>=0?"+":"")+S.pnl.toFixed(0), S.pnl>=0?"pos":"neg",
+           `ROI ${roi>=0?"+":""}${(roi*100).toFixed(1)}% ・ ${S.n_settled} 注已結算`)+
+      tile("你的命中率", (S.you_hits/S.n_settled*100).toFixed(0)+"%", "", `${S.you_hits}/${S.n_settled} 命中`)+
+      tile("模型命中率（同場）", (S.model_hits/S.n_settled*100).toFixed(0)+"%", "", `${S.model_hits}/${S.n_settled} 命中`)+
+      tile("你 vs 模型",
+           S.you_hits>S.model_hits?"你較準":(S.you_hits<S.model_hits?"模型較準":"平手"),
+           S.you_hits>S.model_hits?"pos":(S.you_hits<S.model_hits?"neg":""),
+           `你 ${S.you_hits} : 模型 ${S.model_hits}（同場命中數）`);
+  }
+  const whoCell = b=>{
+    if(b.status==="待開賽"||b.status==="無法對應"||b.status==="缺盤口線") return b.status;
+    if(b.who==null) return "—";
+    return b.who==="both"?"都對":b.who==="neither"?"都錯":
+      b.who==="you"?"<span class='ok'>你對 ✓</span>":"<span class='no'>模型對</span>";
+  };
+  $("#mbBody").innerHTML = !M.length ?
+    `<tr><td colspan="8" class="empty">還沒有記錄。在 repo 的 <b>data/my_bets.csv</b> 加一列你的下注、commit 即可（見下方說明）。</td></tr>` :
+    M.map(b=>{
+      const pnlTxt = b.pnl==null?"—":(b.pnl>=0?"+":"")+b.pnl.toFixed(0);
+      const pnlCls = b.pnl==null?"":(b.pnl>0?"ok":(b.pnl<0?"no":""));
+      const agreeTag = b.agree==null?"":(b.agree?" <span class='seg'>同</span>":" <span class='seg'>異</span>");
+      return `<tr><td>${b.date}</td><td>${b.matchup}</td><td><b>${b.target_label}</b></td>`+
+        `<td class="num">${b.stake}</td><td class="num">${b.odds}</td>`+
+        `<td>${b.model_side}${agreeTag}</td><td>${whoCell(b)}</td>`+
+        `<td class="num ${pnlCls}">${pnlTxt}</td></tr>`;
+    }).join("");
+  $("#mbNote").innerHTML =
+    "紀錄存在你 repo 的 <b>data/my_bets.csv</b>，所以<b>任何裝置打開網站都看得到</b>。要新增一注：在 GitHub 打開該檔、加一列、Commit，下次排程就會更新。"+
+    "欄位：<code>date,away,home,market,side,stake,odds,line</code>（market 填 ML 或 OU；ML 的 side 填隊伍縮寫，OU 填 over/under 並填 line）。"+
+    "「誰對」比較你和模型當時看好的一邊誰猜中。此為個人記錄工具、非投注建議。";
+})();
 
 // ---- history table ----
 let filter = "all";
