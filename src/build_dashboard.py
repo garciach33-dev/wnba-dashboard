@@ -237,6 +237,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-radius:10px;padding:10px 14px;margin:0 0 14px;line-height:1.6}
   .seg{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;background:var(--chip);
     color:var(--text-secondary);margin-right:6px}
+  /* 判斷 pill + 總體建議 banner */
+  .j{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap}
+  .j-avoid{background:rgba(208,59,59,.14);color:var(--bad)}
+  .j-watch{background:rgba(234,161,0,.16);color:#a86b00}
+  .j-weak{background:var(--chip);color:var(--muted)}
+  :root[data-theme="dark"] .j-watch{color:#fab219}
+  @media (prefers-color-scheme:dark){:root[data-theme="auto"] .j-watch{color:#fab219}}
+  .decision{border-radius:12px;padding:14px 16px;margin:0 0 14px;font-size:13px;line-height:1.6;
+    border:1px solid var(--border)}
+  .decision b{font-size:14px}
+  .decision.hold{background:rgba(234,161,0,.10)}
+  .decision.stop{background:rgba(208,59,59,.10)}
+  .decision.go{background:rgba(12,163,12,.10)}
+  .jhint{font-size:11px;color:var(--muted);margin-top:2px}
   footer{margin-top:40px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:14px}
 </style>
 </head>
@@ -257,12 +271,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h2>投注評估（紙上模擬） <span class="count">edge ≥ 3% 自動記一注・非投注建議</span></h2>
     <div class="disclaimer" id="betDisclaimer"></div>
     <div class="kpis" id="paperKpis"></div>
+    <div class="decision" id="decision"></div>
 
     <h2>輸贏候選（獨贏） <span class="count" id="candMLCount"></span></h2>
+    <div class="note" style="margin:0 0 8px">「候選」= 值得看一眼的觀察名單，不是下注建議。請以「判斷」欄與上方總體建議為準。</div>
     <div class="tablewrap">
       <table>
         <thead><tr><th>開賽</th><th>對戰</th><th>下注邊</th>
-          <th class="num">模型勝率</th><th class="num">市場勝率</th><th class="num">edge</th></tr></thead>
+          <th class="num">模型勝率</th><th class="num">市場勝率</th><th class="num">edge</th><th>判斷</th></tr></thead>
         <tbody id="candMLBody"></tbody>
       </table>
     </div>
@@ -271,7 +287,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="tablewrap">
       <table>
         <thead><tr><th>開賽</th><th>對戰</th><th>下注邊</th>
-          <th class="num">模型總分</th><th class="num">盤口線</th><th class="num">edge</th></tr></thead>
+          <th class="num">模型總分</th><th class="num">盤口線</th><th class="num">edge</th><th>判斷</th></tr></thead>
         <tbody id="candTotalBody"></tbody>
       </table>
     </div>
@@ -434,13 +450,58 @@ if(DATA.has_market){
   }
   $("#paperKpis").innerHTML = paperTile("獨贏 ROI", P.ml) + paperTile("大小分 ROI", P.total);
 
+  // ---- 決策判斷邏輯 ----
+  // 每一列給一個「判斷」：大 edge（尤其押冷門）多半是模型漏看→觀望；
+  // 溫和 edge 合理但未驗證→候選觀察；接近門檻→訊號微弱。
+  function jml(g){
+    const e = g.edge_ml;
+    const backP = g.paper_ml_side==="home" ? g.market_p_home : 1-g.market_p_home;
+    const dog = backP < 0.5;                       // 是否在押冷門
+    if(e >= 0.12) return {c:"j-avoid", t:"避開", h:"edge 過大，多半是模型漏看資訊"};
+    if(dog && e >= 0.08) return {c:"j-avoid", t:"避開", h:"大 edge 押冷門，逆選擇風險高"};
+    if(e >= 0.05) return {c:"j-watch", t:"候選觀察", h:"edge 溫和合理，但尚未經 CLV 驗證"};
+    return {c:"j-weak", t:"訊號微弱", h:"edge 偏小，可能只是雜訊"};
+  }
+  function jtot(g){
+    const e = g.edge_total;
+    if(e >= 0.12) return {c:"j-avoid", t:"避開", h:"edge 過大，模型與盤口差太多"};
+    if(e >= 0.05) return {c:"j-watch", t:"候選觀察", h:"edge 溫和合理，但尚未經 CLV 驗證"};
+    return {c:"j-weak", t:"訊號微弱", h:"edge 偏小，可能只是雜訊"};
+  }
+  function jcell(j){ return `<td><span class="j ${j.c}">${j.t}</span><div class="jhint">${j.h}</div></td>`; }
+
+  // ---- 總體建議 banner：依樣本數與整體 CLV 決定該不該進場 ----
+  (function(){
+    const P = DATA.paper, n = P.ml.n + P.total.n;
+    const clvs = [P.ml.avg_clv, P.total.avg_clv].filter(x=>x!=null);
+    const avgClv = clvs.length ? clvs.reduce((a,b)=>a+b,0)/clvs.length : null;
+    let cls, html;
+    if(n < 20){
+      cls = "hold";
+      html = `<b>總體建議：先全部觀望、不下真錢。</b><br>目前只累積了 ${n} 注，樣本太小、還無法判斷模型有沒有真 edge。`+
+        `請先讓它跑，等累積到約 30 注、且下方「平均 CLV」有意義後再回來看這裡。`;
+    } else if(avgClv == null || avgClv <= 0){
+      cls = "stop";
+      html = `<b>總體建議：繼續紙上觀察、不投入真錢。</b><br>目前 ${n} 注的平均 CLV 為 `+
+        `${avgClv==null?"—":(avgClv*100).toFixed(1)+"pp"}（≤0），代表你的下注長期<b>輸給收盤線</b>——還沒看到可信的 edge。`+
+        `這時候下真錢，期望值是負的。`;
+    } else {
+      cls = "go";
+      html = `<b>總體建議：訊號初步為正，若要試僅小注、且只挑「候選觀察」。</b><br>目前 ${n} 注平均 CLV `+
+        `+${(avgClv*100).toFixed(1)}pp（>0），代表你平均<b>贏過收盤線</b>，訊號較可信。`+
+        `即便如此，也請避開「避開」標籤那種大 edge、只挑溫和的、下小注控管風險，並持續看 CLV 是否維持為正。`;
+    }
+    $("#decision").className = "decision " + cls;
+    $("#decision").innerHTML = html + `<div class="jhint" style="margin-top:6px">此為分析輔助、非投注建議；投注長期為負期望、有輸錢風險。</div>`;
+  })();
+
   // ---- 候選：輸贏（獨贏）與 比分（大小分）各自一張表，各自照 edge 由大到小 ----
   const ctz = {timeZone:"Asia/Taipei", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"};
   const C = DATA.edge_candidates || [];
 
   const mlC = C.filter(g=>g.paper_ml_side).sort((a,b)=>b.edge_ml-a.edge_ml);
   $("#candMLCount").textContent = `${mlC.length} 場`;
-  if(!mlC.length){ $("#candMLBody").innerHTML = `<tr><td colspan="6" class="empty">今天沒有超過門檻的獨贏 edge。</td></tr>`; }
+  if(!mlC.length){ $("#candMLBody").innerHTML = `<tr><td colspan="7" class="empty">今天沒有超過門檻的獨贏 edge。</td></tr>`; }
   else $("#candMLBody").innerHTML = mlC.map(g=>{
     const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
     const sideAbbr = g.paper_ml_side==="home"?g.home_abbr:g.away_abbr;
@@ -448,18 +509,20 @@ if(DATA.has_market){
     const modp = g.paper_ml_side==="home"?g.p_home_win:1-g.p_home_win;
     return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
       `<td><b>${sideAbbr}</b></td><td class="num">${(modp*100).toFixed(0)}%</td>`+
-      `<td class="num">${(mp*100).toFixed(0)}%</td><td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td></tr>`;
+      `<td class="num">${(mp*100).toFixed(0)}%</td><td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td>`+
+      jcell(jml(g))+`</tr>`;
   }).join("");
 
   const totC = C.filter(g=>g.paper_total_side).sort((a,b)=>b.edge_total-a.edge_total);
   $("#candTotalCount").textContent = `${totC.length} 場`;
-  if(!totC.length){ $("#candTotalBody").innerHTML = `<tr><td colspan="6" class="empty">今天沒有超過門檻的大小分 edge。</td></tr>`; }
+  if(!totC.length){ $("#candTotalBody").innerHTML = `<tr><td colspan="7" class="empty">今天沒有超過門檻的大小分 edge。</td></tr>`; }
   else $("#candTotalBody").innerHTML = totC.map(g=>{
     const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
     const sideTxt = g.paper_total_side==="over"?`大分 O ${g.market_total_line}`:`小分 U ${g.market_total_line}`;
     return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
       `<td><b>${sideTxt}</b></td><td class="num">${Math.round(g.pred_total)}</td>`+
-      `<td class="num">${g.market_total_line}</td><td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td></tr>`;
+      `<td class="num">${g.market_total_line}</td><td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td>`+
+      jcell(jtot(g))+`</tr>`;
   }).join("");
 
   // ---- 紙上下注紀錄：同樣拆兩張表 ----
