@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -149,7 +150,6 @@ def gather_data() -> dict:
 
     pending = _rows(conn, "status='pending'", "game_date ASC")
     settled = _rows(conn, "status='final'", "game_date DESC")
-    mybets, mybets_stats = load_mybets(conn)
     conn.close()
 
     # 整體指標
@@ -200,8 +200,7 @@ def gather_data() -> dict:
         },
         "has_market": bool(has_market),
         "paper": paper,
-        "mybets": mybets,
-        "mybets_stats": mybets_stats,
+        "bets_endpoint": os.environ.get("BETS_ENDPOINT", "").strip(),
         "edge_candidates": cands,
         "paper_bets": paper_bets,
         "pending": pending,
@@ -549,8 +548,32 @@ else {
       </div>
       <span class="pick">預測勝方：${pickAbbr}　預測總分 ${Math.round(g.pred_total)}　信心 ${g.confidence}</span>
       ${marketRows(g)}
+      ${mybetBlock(g)}
     </div>`;
   }).join("");
+}
+
+// 每張卡片的「記錄我的下注」表單（送出後存到 Google 後端）
+function mybetBlock(g){
+  if(!DATA.bets_endpoint) return "";   // 未設定後端就不顯示表單
+  const line = g.market_total_line!=null ? g.market_total_line : "";
+  const gd = new Date(g.game_date).toLocaleDateString("en-CA",{timeZone:"Asia/Taipei"}); // YYYY-MM-DD
+  return `<div class="mybet" data-away="${g.away_abbr}" data-home="${g.home_abbr}" data-date="${gd}">
+    <div class="mybet-list"></div>
+    <button class="mybet-toggle" type="button">＋ 記錄我的下注</button>
+    <div class="mybet-form">
+      <select class="mb-target">
+        <option value="ML|away">${g.away_abbr} 獨贏</option>
+        <option value="ML|home">${g.home_abbr} 獨贏</option>
+        <option value="TOT|over">大分</option>
+        <option value="TOT|under">小分</option>
+      </select>
+      <input class="mb-stake" type="number" placeholder="注額" inputmode="decimal">
+      <input class="mb-odds" type="number" placeholder="賠率" inputmode="decimal">
+      <input class="mb-line" type="number" placeholder="盤口線" inputmode="decimal" style="display:none" value="${line}">
+      <button class="mybet-save" type="button">儲存</button>
+    </div>
+  </div>`;
 }
 
 // 卡片內的市場對照（有盤口才顯示）
@@ -695,49 +718,153 @@ if(DATA.has_market){
     : `<tr><td colspan="6" class="empty">還沒有已結算的大小分紙上下注。</td></tr>`;
 }
 
-// ==== 我的下注紀錄（跨裝置：從 repo 的 data/my_bets.csv 讀，伺服器端算好）＋ 與模型比對 ====
-(function(){
-  const M = DATA.mybets || [];
-  const S = DATA.mybets_stats || null;
-  $("#mbCount").textContent = `${M.length} 注`;
-  const tile=(label,val,cls,hint)=>`<div class="kpi"><div class="label">${label}</div>`+
-    `<div class="val ${cls||''}">${val}</div><div class="hint">${hint||''}</div></div>`;
-  if(!S || !S.n_settled){
-    $("#mbKpis").innerHTML = tile("尚無已結算下注","—","", M.length?"比賽打完後才有統計":"還沒有任何記錄");
-  } else {
-    const roi=S.roi;
-    $("#mbKpis").innerHTML =
-      tile("淨損益（依你的賠率）", (S.pnl>=0?"+":"")+S.pnl.toFixed(0), S.pnl>=0?"pos":"neg",
-           `ROI ${roi>=0?"+":""}${(roi*100).toFixed(1)}% ・ ${S.n_settled} 注已結算`)+
-      tile("你的命中率", (S.you_hits/S.n_settled*100).toFixed(0)+"%", "", `${S.you_hits}/${S.n_settled} 命中`)+
-      tile("模型命中率（同場）", (S.model_hits/S.n_settled*100).toFixed(0)+"%", "", `${S.model_hits}/${S.n_settled} 命中`)+
-      tile("你 vs 模型",
-           S.you_hits>S.model_hits?"你較準":(S.you_hits<S.model_hits?"模型較準":"平手"),
-           S.you_hits>S.model_hits?"pos":(S.you_hits<S.model_hits?"neg":""),
-           `你 ${S.you_hits} : 模型 ${S.model_hits}（同場命中數）`);
+// ==== 我的下注紀錄（跨裝置：存到 Google 後端；即時、任何裝置同步）＋ 與模型比對 ====
+const EP = DATA.bets_endpoint || "";
+let MYBETS = [];   // 從後端抓來的下注列表
+
+// 用 (客,主,台北日期) 找到對應比賽，才能算損益與模型看法
+function tpeDate(iso){ try{ return new Date(iso).toLocaleDateString("en-CA",{timeZone:"Asia/Taipei"}); }catch(e){ return (iso||"").slice(0,10); } }
+const GAMEIDX = {};
+(DATA.settled||[]).concat(DATA.pending||[]).forEach(g=>{
+  GAMEIDX[[g.away_abbr,g.home_abbr,tpeDate(g.game_date)].join("|")] = g;
+});
+function gameOf(b){ return GAMEIDX[[String(b.away).toUpperCase(),String(b.home).toUpperCase(),String(b.date).slice(0,10)].join("|")]; }
+
+function targetLabel(b){
+  if(String(b.market).toUpperCase()==="ML") return (String(b.side).toUpperCase()===String(b.home).toUpperCase()?b.home:b.away)+" 獨贏";
+  const s=String(b.side).toLowerCase();
+  return (s==="over"?"大分 O":"小分 U")+(b.line!==""&&b.line!=null?(" "+b.line):"");
+}
+function betResult(b){
+  const g=gameOf(b);
+  if(!g) return {status:"無法對應", pnl:null, yw:null};
+  if(g.actual_winner==null) return {status:"待開賽", pnl:null, yw:null};
+  const stake=+b.stake, odds=+b.odds;
+  if(String(b.market).toUpperCase()==="ML"){
+    const my = String(b.side).toUpperCase()===String(b.home).toUpperCase()?"home":"away";
+    const yw = (my===g.actual_winner);
+    return {status: yw?"贏":"輸", pnl: yw? stake*(odds-1) : -stake, yw};
   }
-  const whoCell = b=>{
-    if(b.status==="待開賽"||b.status==="無法對應"||b.status==="缺盤口線") return b.status;
-    if(b.who==null) return "—";
-    return b.who==="both"?"都對":b.who==="neither"?"都錯":
-      b.who==="you"?"<span class='ok'>你對 ✓</span>":"<span class='no'>模型對</span>";
-  };
-  $("#mbBody").innerHTML = !M.length ?
-    `<tr><td colspan="8" class="empty">還沒有記錄。在 repo 的 <b>data/my_bets.csv</b> 加一列你的下注、commit 即可（見下方說明）。</td></tr>` :
-    M.map(b=>{
-      const pnlTxt = b.pnl==null?"—":(b.pnl>=0?"+":"")+b.pnl.toFixed(0);
-      const pnlCls = b.pnl==null?"":(b.pnl>0?"ok":(b.pnl<0?"no":""));
-      const agreeTag = b.agree==null?"":(b.agree?" <span class='seg'>同</span>":" <span class='seg'>異</span>");
-      return `<tr><td>${b.date}</td><td>${b.matchup}</td><td><b>${b.target_label}</b></td>`+
-        `<td class="num">${b.stake}</td><td class="num">${b.odds}</td>`+
-        `<td>${b.model_side}${agreeTag}</td><td>${whoCell(b)}</td>`+
-        `<td class="num ${pnlCls}">${pnlTxt}</td></tr>`;
+  const line=+b.line, s=String(b.side).toLowerCase();
+  if(b.line===""||b.line==null||g.actual_total==null) return {status:"缺盤口線", pnl:null, yw:null};
+  if(g.actual_total===line) return {status:"退注", pnl:0, yw:null};
+  const ow=g.actual_total>line, yw=(s==="over"&&ow)||(s==="under"&&!ow);
+  return {status: yw?"贏":"輸", pnl: yw? stake*(odds-1) : -stake, yw};
+}
+function modelView(b){
+  const g=gameOf(b); if(!g) return {side:"—", agree:null, mw:null};
+  if(String(b.market).toUpperCase()==="ML"){
+    const mSide = (g.p_home_win!=null&&g.p_home_win>=0.5)?"home":"away";
+    const my = String(b.side).toUpperCase()===String(b.home).toUpperCase()?"home":"away";
+    let mw=null; if(g.actual_winner!=null) mw=(mSide===g.actual_winner);
+    return {side:(mSide==="home"?g.home_abbr:g.away_abbr)+" 贏", agree:(mSide===my), mw};
+  }
+  if(b.line===""||b.line==null) return {side:"—", agree:null, mw:null};
+  const line=+b.line, s=String(b.side).toLowerCase();
+  const mSide = (g.pred_total!=null&&g.pred_total>line)?"over":"under";
+  let mw=null; if(g.actual_total!=null&&g.actual_total!==line){ const ow=g.actual_total>line; mw=(mSide==="over"&&ow)||(mSide==="under"&&!ow); }
+  return {side:(mSide==="over"?"大分":"小分"), agree:(mSide===s), mw};
+}
+
+function renderMyBets(){
+  const bets=[...MYBETS].sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  // 卡片上已存注
+  document.querySelectorAll(".mybet").forEach(el=>{
+    const key=[el.dataset.away,el.dataset.home,el.dataset.date].join("|");
+    const list=bets.filter(b=>[String(b.away).toUpperCase(),String(b.home).toUpperCase(),String(b.date).slice(0,10)].join("|")===key);
+    el.querySelector(".mybet-list").innerHTML=list.map(b=>{
+      const r=betResult(b);
+      const tag=r.status==="待開賽"?"":`・${r.status}${r.pnl!=null?`（${r.pnl>=0?"+":""}${r.pnl.toFixed(0)}）`:""}`;
+      return `<div class="mybet-chip"><span>${targetLabel(b)}　${b.stake}@${b.odds}${tag}</span>`+
+        `<button class="del" data-id="${b.id}" title="刪除">×</button></div>`;
     }).join("");
-  $("#mbNote").innerHTML =
-    "紀錄存在你 repo 的 <b>data/my_bets.csv</b>，所以<b>任何裝置打開網站都看得到</b>。要新增一注：在 GitHub 打開該檔、加一列、Commit，下次排程就會更新。"+
-    "欄位：<code>date,away,home,market,side,stake,odds,line</code>（market 填 ML 或 OU；ML 的 side 填隊伍縮寫，OU 填 over/under 並填 line）。"+
-    "「誰對」比較你和模型當時看好的一邊誰猜中。此為個人記錄工具、非投注建議。";
-})();
+  });
+  const tile=(l,v,c,h)=>`<div class="kpi"><div class="label">${l}</div><div class="val ${c||''}">${v}</div><div class="hint">${h||''}</div></div>`;
+  const decided=bets.map(b=>({b,r:betResult(b),mv:modelView(b)})).filter(x=>x.r.yw!=null);
+  $("#mbCount").textContent=`${bets.length} 注`;
+  if(!decided.length){
+    $("#mbKpis").innerHTML=tile("尚無已結算下注","—","",bets.length?"比賽打完後才有統計":"還沒有任何記錄");
+  } else {
+    const n=decided.length, pnl=decided.reduce((s,x)=>s+(x.r.pnl||0),0), staked=decided.reduce((s,x)=>s+ +x.b.stake,0);
+    const yh=decided.filter(x=>x.r.yw).length, mh=decided.filter(x=>x.mv.mw===true).length, roi=staked?pnl/staked*100:0;
+    $("#mbKpis").innerHTML=
+      tile("淨損益（依你的賠率）",(pnl>=0?"+":"")+pnl.toFixed(0),pnl>=0?"pos":"neg",`ROI ${roi>=0?"+":""}${roi.toFixed(1)}% ・ ${n} 注已結算`)+
+      tile("你的命中率",(yh/n*100).toFixed(0)+"%","",`${yh}/${n} 命中`)+
+      tile("模型命中率（同場）",(mh/n*100).toFixed(0)+"%","",`${mh}/${n} 命中`)+
+      tile("你 vs 模型",yh>mh?"你較準":(yh<mh?"模型較準":"平手"),yh>mh?"pos":(yh<mh?"neg":""),`你 ${yh} : 模型 ${mh}`);
+  }
+  $("#mbBody").innerHTML = !bets.length ?
+    `<tr><td colspan="8" class="empty">${EP?"還沒有記錄。到上面任一張比賽卡片點「＋ 記錄我的下注」。":"尚未設定 Google 後端（見下方說明）。"}</td></tr>` :
+    bets.map(b=>{
+      const r=betResult(b), mv=modelView(b);
+      const pnlTxt=r.pnl==null?"—":(r.pnl>=0?"+":"")+r.pnl.toFixed(0);
+      const pnlCls=r.pnl==null?"":(r.pnl>0?"ok":(r.pnl<0?"no":""));
+      let who="—";
+      if(r.yw!=null&&mv.mw!=null) who=r.yw&&mv.mw?"都對":(!r.yw&&!mv.mw?"都錯":(r.yw?"<span class='ok'>你對 ✓</span>":"<span class='no'>模型對</span>"));
+      else if(r.status==="待開賽"||r.status==="無法對應"||r.status==="缺盤口線") who=r.status;
+      const agreeTag=mv.agree==null?"":(mv.agree?" <span class='seg'>同</span>":" <span class='seg'>異</span>");
+      return `<tr><td>${String(b.date).slice(5)}</td><td>${b.away}@${b.home}</td><td><b>${targetLabel(b)}</b></td>`+
+        `<td class="num">${b.stake}</td><td class="num">${b.odds}</td><td>${mv.side}${agreeTag}</td>`+
+        `<td>${who}</td><td class="num ${pnlCls}">${pnlTxt}</td></tr>`;
+    }).join("");
+  $("#mbNote").innerHTML = EP ?
+    "紀錄存在你的 Google 試算表，<b>任何裝置打開網站都同步看得到</b>。到任一張比賽卡片點「＋ 記錄我的下注」即可新增。「誰對」比較你和模型當時看好的一邊誰猜中。此為個人記錄工具、非投注建議。" :
+    "尚未接上 Google 後端——請照我提供的步驟建立 Google 試算表與 Apps Script，並把網址設成 GitHub secret <code>BETS_ENDPOINT</code>。設好後這區就會出現記錄表單。";
+}
+
+// JSONP 讀取（避開跨網域限制）
+function fetchBets(){
+  if(!EP) return Promise.resolve([]);
+  return new Promise((resolve)=>{
+    const cb="__mb_cb_"+Math.floor(Math.random()*1e9);
+    const s=document.createElement("script");
+    window[cb]=d=>{ resolve((d&&d.bets)||[]); delete window[cb]; s.remove(); };
+    s.onerror=()=>{ resolve(MYBETS); s.remove(); };
+    s.src=EP+"?callback="+cb;
+    document.body.appendChild(s);
+  });
+}
+function reloadBets(){ fetchBets().then(b=>{ MYBETS=b; renderMyBets(); }); }
+// 寫入用 no-cors POST（送出後隔一下重抓）
+function postBet(payload){
+  return fetch(EP,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify(payload)});
+}
+
+// 事件：展開表單 / 儲存 / 刪除 / 切換盤口線欄
+document.addEventListener("click", e=>{
+  const t=e.target;
+  if(t.classList.contains("mybet-toggle")){ t.nextElementSibling.classList.toggle("show"); }
+  else if(t.classList.contains("mybet-save")){
+    const box=t.closest(".mybet"), sel=box.querySelector(".mb-target").value;
+    const stake=parseFloat(box.querySelector(".mb-stake").value), odds=parseFloat(box.querySelector(".mb-odds").value);
+    const lineRaw=box.querySelector(".mb-line").value;
+    if(!(stake>0)||!(odds>1)){ alert("請填有效的注額與賠率（賠率需 > 1）。"); return; }
+    const isTot=sel.startsWith("TOT"); const [mkt,side]=sel.split("|");
+    const line=isTot?(lineRaw!==""?parseFloat(lineRaw):null):"";
+    if(isTot&&line==null){ alert("大小分請填盤口線。"); return; }
+    const sideVal = isTot? side : (side==="home"?box.dataset.home:box.dataset.away);
+    const bet={date:box.dataset.date, away:box.dataset.away, home:box.dataset.home,
+      market:mkt==="TOT"?"OU":"ML", side:sideVal, stake, odds, line:isTot?line:""};
+    t.textContent="儲存中…"; t.disabled=true;
+    MYBETS.push({...bet, id:"tmp_"+Date.now()}); renderMyBets();     // 樂觀更新
+    postBet(bet).finally(()=>{ setTimeout(()=>{ reloadBets(); }, 900);
+      box.querySelector(".mybet-form").classList.remove("show");
+      box.querySelector(".mb-stake").value=""; box.querySelector(".mb-odds").value="";
+      t.textContent="儲存"; t.disabled=false; });
+  }
+  else if(t.classList.contains("del")){
+    if(!EP) return; const id=t.dataset.id;
+    MYBETS=MYBETS.filter(b=>String(b.id)!==String(id)); renderMyBets();
+    postBet({action:"delete", id}).finally(()=>setTimeout(reloadBets, 900));
+  }
+});
+document.addEventListener("change", e=>{
+  if(e.target.classList.contains("mb-target")){
+    const box=e.target.closest(".mybet");
+    box.querySelector(".mb-line").style.display = e.target.value.startsWith("TOT")?"":"none";
+  }
+});
+reloadBets();
 
 // ---- history table ----
 let filter = "all";
