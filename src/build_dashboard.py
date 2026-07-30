@@ -409,7 +409,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="decision" id="decision"></div>
 
     <h2>輸贏候選（獨贏） <span class="count" id="candMLCount"></span></h2>
-    <div class="note" style="margin:0 0 8px">「候選」= 值得看一眼的觀察名單，不是下注建議。請以「判斷」欄與上方總體建議為準。</div>
+    <div class="note" style="margin:0 0 8px">「候選」= 值得看一眼的觀察名單，不是下注建議。請以「判斷」欄與上方總體建議為準。<br>
+      「模型勝率」與「市場勝率」都是<b>下注邊</b>的勝率（不是主隊）。所以下注邊機率低於 50% 很正常——
+      這是在賭「被低估」，不是在賭「誰會贏」。兩欄都是<b>記注當下</b>的凍結值；若模型後來改變看法，下方會標「現在 x%」，
+      判斷欄則會顯示「已失效」。</div>
     <div class="tablewrap">
       <table>
         <thead><tr><th>開賽</th><th>對戰</th><th>下注邊</th>
@@ -624,10 +627,20 @@ if(DATA.has_market){
   // ---- 決策判斷邏輯 ----
   // 每一列給一個「判斷」：大 edge（尤其押冷門）多半是模型漏看→觀望；
   // 溫和 edge 合理但未驗證→候選觀察；接近門檻→訊號微弱。
+  // 進場當下模型看這一邊的機率（凍結）；沒有就退回現況
+  function entryP(g){
+    const eh = (g.entry_p_home_model==null) ? g.p_home_win : g.entry_p_home_model;
+    return g.paper_ml_side==="home" ? eh : 1-eh;
+  }
+  // 今天模型看這一邊的機率（每天會變）
+  function nowP(g){ return g.paper_ml_side==="home" ? g.p_home_win : 1-g.p_home_win; }
+
   function jml(g){
     const e = g.edge_ml;
     const backP = g.paper_ml_side==="home" ? g.market_p_home : 1-g.market_p_home;
     const dog = backP < 0.5;                       // 是否在押冷門
+    // 這幾天模型改變看法、已經不站在這一邊了 → 這個 edge 已經失效
+    if(nowP(g) < backP) return {c:"j-avoid", t:"已失效", h:"模型後來翻盤，現在不站這邊了"};
     if(e >= 0.12) return {c:"j-avoid", t:"避開", h:"edge 過大，多半是模型漏看資訊"};
     if(dog && e >= 0.08) return {c:"j-avoid", t:"避開", h:"大 edge 押冷門，逆選擇風險高"};
     if(e >= 0.05) return {c:"j-watch", t:"候選觀察", h:"edge 溫和合理，但尚未經 CLV 驗證"};
@@ -635,6 +648,11 @@ if(DATA.has_market){
   }
   function jtot(g){
     const e = g.edge_total;
+    const line = g.market_total_line;
+    // 模型總分後來跑到盤口線的另一邊 → 這個 edge 已經失效
+    if(line!=null && ((g.paper_total_side==="over" && g.pred_total < line) ||
+                      (g.paper_total_side==="under" && g.pred_total > line)))
+      return {c:"j-avoid", t:"已失效", h:"模型總分後來跨過盤口線，方向反了"};
     if(e >= 0.12) return {c:"j-avoid", t:"避開", h:"edge 過大，模型與盤口差太多"};
     if(e >= 0.05) return {c:"j-watch", t:"候選觀察", h:"edge 溫和合理，但尚未經 CLV 驗證"};
     return {c:"j-weak", t:"訊號微弱", h:"edge 偏小，可能只是雜訊"};
@@ -677,9 +695,11 @@ if(DATA.has_market){
     const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
     const sideAbbr = g.paper_ml_side==="home"?g.home_abbr:g.away_abbr;
     const mp = g.paper_ml_side==="home"?g.market_p_home:1-g.market_p_home;
-    const modp = g.paper_ml_side==="home"?g.p_home_win:1-g.p_home_win;
+    const modp = entryP(g), curp = nowP(g);
+    const drift = Math.abs(curp-modp) >= 0.02
+      ? `<div class="jhint">現在 ${(curp*100).toFixed(0)}%</div>` : "";
     return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
-      `<td><b>${sideAbbr}</b></td><td class="num">${(modp*100).toFixed(0)}%</td>`+
+      `<td><b>${sideAbbr}</b></td><td class="num">${(modp*100).toFixed(0)}%${drift}</td>`+
       `<td class="num">${(mp*100).toFixed(0)}%</td><td class="num ok">+${(g.edge_ml*100).toFixed(1)}%</td>`+
       jcell(jml(g))+`</tr>`;
   }).join("");
@@ -690,8 +710,11 @@ if(DATA.has_market){
   else $("#candTotalBody").innerHTML = totC.map(g=>{
     const d = new Date(g.game_date).toLocaleString("zh-TW", ctz);
     const sideTxt = g.paper_total_side==="over"?`大分 O ${g.market_total_line}`:`小分 U ${g.market_total_line}`;
+    const et = (g.entry_pred_total==null) ? g.pred_total : g.entry_pred_total;
+    const tdrift = Math.abs(g.pred_total-et) >= 1
+      ? `<div class="jhint">現在 ${Math.round(g.pred_total)}</div>` : "";
     return `<tr><td>${d}</td><td>${g.away_abbr}@${g.home_abbr}</td>`+
-      `<td><b>${sideTxt}</b></td><td class="num">${Math.round(g.pred_total)}</td>`+
+      `<td><b>${sideTxt}</b></td><td class="num">${Math.round(et)}${tdrift}</td>`+
       `<td class="num">${g.market_total_line}</td><td class="num ok">+${(g.edge_total*100).toFixed(1)}%</td>`+
       jcell(jtot(g))+`</tr>`;
   }).join("");
