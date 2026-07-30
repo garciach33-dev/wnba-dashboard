@@ -113,6 +113,7 @@ def update_market(model, threshold: float = EDGE_THRESHOLD, api_key: str | None 
                     flagged_ml += 1
 
             edge_total = paper_total = None
+            model_total_entry = r["pred_total"]
             if mkt_line is not None and mkt_p_over is not None:
                 model_p_over = float(model.prob_over(r["pred_total"], mkt_line))
                 if model_p_over >= mkt_p_over:
@@ -130,12 +131,14 @@ def update_market(model, threshold: float = EDGE_THRESHOLD, api_key: str | None 
                    market_captured_at=?, market_n_books=?,
                    market_p_home=?, market_dec_home=?, market_dec_away=?,
                    market_total_line=?, market_dec_over=?, market_dec_under=?, market_p_over=?,
-                   edge_ml=?, edge_total=?, paper_ml_side=?, paper_total_side=?
+                   edge_ml=?, edge_total=?, paper_ml_side=?, paper_total_side=?,
+                   entry_p_home_model=?, entry_pred_total=?
                    WHERE game_id=?""",
                 (_now(), m.get("n_books"),
                  mkt_p_home, m.get("dec_home"), m.get("dec_away"),
                  mkt_line, m.get("dec_over"), m.get("dec_under"), mkt_p_over,
-                 edge_ml, edge_total, paper_ml, paper_total, gid),
+                 edge_ml, edge_total, paper_ml, paper_total,
+                 model_p_home, model_total_entry, gid),
             )
     conn.commit()
     conn.close()
