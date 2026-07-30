@@ -1,0 +1,72 @@
+name: 測試 ESPN 端點連通性
+
+# 一次性診斷用：只能手動觸發，不會排程、不碰資料庫、不部署。
+# 目的是確認 GitHub Actions 的網路能不能連到 ESPN 的即時傷兵資料。
+# 測完可以直接刪掉這個檔案。
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe ESPN endpoints
+        shell: bash
+        run: |
+          cat > probe.py <<'PY'
+          import json, urllib.request, urllib.error
+
+          UA = {"User-Agent": "Mozilla/5.0 (compatible; wnba-dashboard/1.0)"}
+
+          TARGETS = [
+              ("控制組 GitHub raw（一定要通，通了才代表測試有效）",
+               "https://raw.githubusercontent.com/sportsdataverse/wehoop-wnba-raw/main/wnba/schedules/parquet/wnba_schedule_2025.parquet"),
+              ("ESPN scoreboard（當日賽況）",
+               "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"),
+              ("ESPN summary 單場（★關鍵：含 injuries 區塊）",
+               "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event=401892393"),
+              ("ESPN core API 球隊傷兵（★備援方案）",
+               "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba/teams/9/injuries"),
+              ("ESPN teams 清單",
+               "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/teams"),
+          ]
+
+          def probe(name, url):
+              try:
+                  req = urllib.request.Request(url, headers=UA)
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      body = r.read(400000)
+                      note = ""
+                      if url.endswith(".parquet"):
+                          note = f"{len(body)} bytes"
+                      else:
+                          try:
+                              d = json.loads(body)
+                              if "summary" in url:
+                                  inj = d.get("injuries") or []
+                                  tot = sum(len(t.get("injuries", [])) for t in inj)
+                                  names = [i["athlete"]["displayName"] + " / " + str(i.get("status"))
+                                           for t in inj for i in t.get("injuries", [])][:5]
+                                  note = f"injuries 區塊 {len(inj)} 隊、共 {tot} 人  範例={names}"
+                              elif "injuries" in url:
+                                  note = f"count={d.get('count')} items={len(d.get('items', []))}"
+                              elif "scoreboard" in url:
+                                  note = f"events={len(d.get('events', []))}"
+                              else:
+                                  note = f"keys={list(d)[:6]}"
+                          except Exception as e:
+                              note = f"(非 JSON: {e})"
+                      print(f"  OK   {r.status}  {name}")
+                      print(f"         {note}")
+                      return True
+              except urllib.error.HTTPError as e:
+                  print(f"  失敗  HTTP {e.code}  {name}")
+              except Exception as e:
+                  print(f"  失敗  {type(e).__name__}: {e}  {name}")
+              return False
+
+          print("=== ESPN 端點連通性測試（從 GitHub Actions 發出）===")
+          ok = sum(probe(n, u) for n, u in TARGETS)
+          print(f"=== 通過 {ok}/{len(TARGETS)} ===")
+          PY
+          python3 probe.py
