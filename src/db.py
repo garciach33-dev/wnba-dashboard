@@ -73,6 +73,11 @@ MARKET_COLUMNS = {
     # 模型 vs 市場的 edge（進場當下）
     "edge_ml": "REAL",
     "edge_total": "REAL",
+    # 進場當下模型的主隊勝率／預測總分（凍結）。
+    # 未來賽事的 p_home_win 每天都會更新，若拿「今天的模型」去配「當初凍結的盤口」，
+    # 表格會出現「下注邊的模型機率反而低於市場」這種自相矛盾的畫面。
+    "entry_p_home_model": "REAL",
+    "entry_pred_total": "REAL",
     # 自動紙上下注（edge 超門檻才記）與結算結果
     "paper_ml_side": "TEXT",      # 'home'/'away'，模型看好且有 edge 的一邊
     "paper_ml_result": "REAL",    # 單位淨利（+賠率-1 / -1）
@@ -88,6 +93,46 @@ def _ensure_columns(conn: sqlite3.Connection):
     for col, typ in MARKET_COLUMNS.items():
         if col not in have:
             conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
+    conn.commit()
+    _backfill_entry_model(conn)
+
+
+def _backfill_entry_model(conn: sqlite3.Connection):
+    """
+    舊資料沒有 entry_p_home_model，但可以精確還原：
+      edge_ml 是「進場當下、下注邊」的模型機率減市場機率，
+      所以 side=home → entry = market_p_home + edge_ml
+          side=away → entry = market_p_home − edge_ml
+    同理，大小分的進場模型總分可由 edge_total 反推回去（常態分佈反函數）。
+    只補得回來的列（有記紙上下注、方向明確者），跑幾次都一樣（冪等）。
+    """
+    conn.execute(
+        """UPDATE predictions SET entry_p_home_model =
+               CASE WHEN paper_ml_side='away' THEN market_p_home - edge_ml
+                    ELSE market_p_home + edge_ml END
+           WHERE entry_p_home_model IS NULL
+             AND paper_ml_side IS NOT NULL
+             AND edge_ml IS NOT NULL AND market_p_home IS NOT NULL"""
+    )
+
+    from statistics import NormalDist          # 標準庫，免額外相依
+    TOTAL_SIGMA = 15.0                          # 與 model.WNBAModel.total_sigma 一致
+    nd = NormalDist()
+    rows = conn.execute(
+        """SELECT game_id, paper_total_side, market_p_over, edge_total, market_total_line
+           FROM predictions
+           WHERE entry_pred_total IS NULL AND paper_total_side IS NOT NULL
+             AND edge_total IS NOT NULL AND market_p_over IS NOT NULL
+             AND market_total_line IS NOT NULL"""
+    ).fetchall()
+    for r in rows:
+        p = (r["market_p_over"] + r["edge_total"]) if r["paper_total_side"] == "over" \
+            else (r["market_p_over"] - r["edge_total"])
+        p = min(max(p, 1e-6), 1 - 1e-6)
+        conn.execute(
+            "UPDATE predictions SET entry_pred_total=? WHERE game_id=?",
+            (r["market_total_line"] + TOTAL_SIGMA * nd.inv_cdf(p), r["game_id"]),
+        )
     conn.commit()
 
 
