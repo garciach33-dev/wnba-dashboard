@@ -34,6 +34,21 @@ from features import FEATURE_COLS, build_feature_table
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "data" / "model.pkl"
 
+# 殘差標準差的膨脹係數。
+#
+# 為什麼需要它：fit() 算 sigma 是用「樣本內」殘差，而樣本內殘差必然比樣本外小
+# （模型多少擬合到了訓練資料的雜訊）。sigma 偏小 → 機率被推得比實際該有的極端。
+# 加了陣容特徵之後這件事變得嚴重：模型敢說話了，但話說得太滿——
+# 走前驗證顯示它講 17% 的那批比賽，實際發生率是 31%。
+# 那種偏差不是無害的保守，它會在熱門那一邊造出假的 edge，
+# 剛好是「模型分佈太窄害你一直押冷門」的鏡像錯誤。
+#
+# 實測（582 場走前）：分差樣本內 sigma 11.88、樣本外殘差 13.25，比值 1.115；
+# 總分樣本內 16.39、樣本外 18.98，比值 1.158。兩邊機制相同，用同一個係數。
+# 1.15 是照樣本外 logloss 挑的，而 1.05~1.25 之間 logloss 幾乎持平
+# （0.6206~0.6212），代表這個選擇落在平坦區、不是過擬合出來的甜蜜點。
+SIGMA_INFLATION = 1.15
+
 
 class WNBAModel:
     def __init__(self):
@@ -48,9 +63,12 @@ class WNBAModel:
         X = d[FEATURE_COLS].values
         self.reg_total.fit(X, d["total"].values)
         self.reg_margin.fit(X, d["margin"].values)
-        # 殘差標準差 → 把點估計（分差/總分）轉成機率時的分佈寬度
-        self.margin_sigma = max(float(np.std(d["margin"].values - self.reg_margin.predict(X))), 6.0)
-        self.total_sigma = max(float(np.std(d["total"].values - self.reg_total.predict(X))), 6.0)
+        # 殘差標準差 → 把點估計（分差/總分）轉成機率時的分佈寬度。
+        # 乘 SIGMA_INFLATION 把「樣本內殘差偏小」這件事修正掉，見上方說明。
+        self.margin_sigma = max(
+            float(np.std(d["margin"].values - self.reg_margin.predict(X))) * SIGMA_INFLATION, 6.0)
+        self.total_sigma = max(
+            float(np.std(d["total"].values - self.reg_total.predict(X))) * SIGMA_INFLATION, 6.0)
         self.baseline_total = float(d["total"].mean())
         return self
 

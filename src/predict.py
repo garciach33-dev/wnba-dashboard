@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from db import connect, existing_game_ids
-from features import build_feature_table
+from features import build_feature_table, load_strength
 from model import WNBAModel
 
 
@@ -80,9 +80,10 @@ def purge_stale_pending(grace_hours: int = 12) -> int:
     return n
 
 
-def generate_predictions(games: pd.DataFrame, model: WNBAModel, refresh: bool = False) -> int:
+def generate_predictions(games: pd.DataFrame, model: WNBAModel, refresh: bool = False,
+                         strength: dict | None = None) -> int:
     """對『未來、未完賽』比賽產生賽前預測快照並寫入 DB。回傳新寫入筆數。"""
-    feat = build_feature_table(games)
+    feat = build_feature_table(games, strength if strength is not None else load_strength())
     now = pd.Timestamp.now(tz="UTC")
     upcoming = feat[(~feat["completed"]) & (feat["date"] >= now)].copy()
     if upcoming.empty:
@@ -91,7 +92,8 @@ def generate_predictions(games: pd.DataFrame, model: WNBAModel, refresh: bool = 
     return _write_rows(upcoming.set_index("game_id"), preds, backfilled=0, refresh=refresh)
 
 
-def backfill_history(games: pd.DataFrame, model: WNBAModel, season: int) -> int:
+def backfill_history(games: pd.DataFrame, model: WNBAModel, season: int,
+                     strength: dict | None = None) -> int:
     """
     回填：對某賽季「已完賽」比賽產生『逐日 walk-forward 樣本外』賽前預測
     （標記 backfilled=1），好讓歷史回顧一開始就有『誠實』的資料。
@@ -99,7 +101,7 @@ def backfill_history(games: pd.DataFrame, model: WNBAModel, season: int) -> int:
     而是對每一天只用該日之前的資料重訓後預測。之後由 settle 補上實際結果。
     """
     from model import walk_forward_predictions
-    feat = build_feature_table(games)
+    feat = build_feature_table(games, strength if strength is not None else load_strength())
     preds = walk_forward_predictions(feat, season)
     if preds.empty:
         return 0
