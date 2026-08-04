@@ -130,6 +130,8 @@ def main():
         finally:
             conn.close()
         print(f"   {up['upcoming']} 場已算，其中 {up['with_injury_data']} 場拿到傷兵名單")
+        print(f"   當下名冊（交易修正）：{up.get('roster_ok', 0)}/{up.get('roster_teams', 0)} 隊抓到"
+              + ("" if up.get("roster_ok") else "  ⚠ 全部沒抓到 → 名單退回『近 10 場上場過的人』"))
         if up["upcoming"]:
             strength = strength_table()
             n_pred2 = generate_predictions(games, model, refresh=True, strength=strength)
