@@ -85,7 +85,8 @@ def main():
         info = update_player_data()
         s = info["sync"]
         print(f"   球員資料：新增 {s['added']} 場（累計 {s['total_games']} 場）、"
-              f"上游未發布 {s['not_published']}、失敗 {s['failed']}")
+              f"上游未發布 {s['not_published']}、失敗 {s['failed']}"
+              + (f"、已放棄不再重試 {s['skipped']}" if s.get("skipped") else ""))
         print(f"   歷史陣容強度 {info['history']} 場")
     except Exception as e:
         print(f"   ⚠ 失敗（{type(e).__name__}: {e}）—— 陣容特徵吃中性填值，其餘流程照跑")
@@ -129,7 +130,8 @@ def main():
             up = players.compute_upcoming(conn, max_games=UPCOMING_INJURY_GAMES)
         finally:
             conn.close()
-        print(f"   {up['upcoming']} 場已算，其中 {up['with_injury_data']} 場拿到傷兵名單")
+        print(f"   {up['upcoming']} 場已算，其中 {up['with_injury_data']} 場拿到傷兵名單、"
+              f"{up.get('roster_only', 0)} 場只用名冊（太遠，不問傷兵）")
         print(f"   當下名冊（交易修正）：{up.get('roster_ok', 0)}/{up.get('roster_teams', 0)} 隊抓到"
               + ("" if up.get("roster_ok") else "  ⚠ 全部沒抓到 → 名單退回『近 10 場上場過的人』"))
         if up["upcoming"]:
