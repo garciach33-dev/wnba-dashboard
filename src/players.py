@@ -41,6 +41,14 @@ DECAY = 0.97                  # 每場對舊資料的衰減，約等於半衰期
 POOL_LOOKBACK = 10            # 近 10 場出現過的人算進輪值名單
 TEAM_MINUTES = 200.0          # 一隊一場 5 人 × 40 分鐘
 
+# 交易／裁員修正：輪值名單是「近 10 場上場過的人」推出來的，這個定義追不上交易。
+# 被交易走的人會賴在舊隊名單裡最多 10 場（WNBA 約兩週半），而且傷兵表查不到他，
+# 會被當成健康可打 → 舊隊強度灌水；新隊則要等他真的上場才算得到他 → 低估。
+# 解法是拿 ESPN 的「當下名冊」跟輪值名單取交集，再把名冊上「最近還在打球」的人補進來。
+# ROSTER_ACTIVE_DAYS 是「補進來」的門檻：只認最近這麼多天在聯盟任一隊上場過的人，
+# 免得把整季沒上場的深板凳算成輪值，他們的 proj_minutes 會是過期的舊資料。
+ROSTER_ACTIVE_DAYS = 21
+
 # 傷兵狀態 → 出賽機率。Out 是確定的，Day-To-Day 是猜的，這個數字可以之後校準。
 PLAY_PROB = {
     "out": 0.0, "injured reserve": 0.0, "suspension": 0.0, "suspended": 0.0,
@@ -260,6 +268,7 @@ class RatingBook:
         self._gmsc: dict[str, float] = defaultdict(float)
         self._recent: dict[str, list[float]] = defaultdict(list)
         self._pool: dict[str, list[set[str]]] = defaultdict(list)
+        self._last_played: dict[str, str] = {}   # 球員 → 最後一次上場的日期（不分球隊）
         self.names: dict[str, str] = {}
         self.last_date: str | None = None
 
@@ -273,21 +282,52 @@ class RatingBook:
         h = self._recent[pid][-POOL_LOOKBACK:]
         return sum(h) / len(h) if h else 0.0
 
-    def pool(self, team: str) -> set[str]:
-        """近 POOL_LOOKBACK 場實際上場過的人，當作這一隊的可用輪值名單。"""
+    def recently_active(self, pid: str, within_days: int = ROSTER_ACTIVE_DAYS) -> bool:
+        """這位球員最近有沒有在聯盟裡（任何一隊）上場過。"""
+        d = self._last_played.get(pid)
+        if not d or not self.last_date:
+            return False
+        try:
+            gap = (datetime.fromisoformat(self.last_date[:10])
+                   - datetime.fromisoformat(d[:10])).days
+        except ValueError:
+            return False
+        return gap <= within_days
+
+    def pool(self, team: str, roster: set[str] | None = None) -> set[str]:
+        """
+        這一隊的可用輪值名單。
+
+        預設是「近 POOL_LOOKBACK 場實際上場過的人」——歷史回填一定要用這個定義，
+        因為那才是當時的事實，拿今天的名冊去描述三週前的比賽就是資料洩漏。
+
+        賽前預測才傳 roster（ESPN 的當下名冊）進來，做兩件事：
+          減：不在名冊上的人剔掉（被交易走、被裁掉的，今天不會替這隊打球）。
+          加：名冊上、最近還在聯盟打過球、但還沒替這隊上場過的人補進來
+              （剛交易過來的）。他的評分與預期分鐘沿用他在原隊的資料，
+              這是個近似，但比「當他不存在」準得多。
+        roster 是空的（抓不到）就完全退回舊行為，不會亂猜。
+        """
         out: set[str] = set()
         for s in self._pool[team][-POOL_LOOKBACK:]:
             out |= s
+        if not roster:
+            return out
+        out &= roster
+        out |= {p for p in roster
+                if p not in out and self._recent.get(p) and self.recently_active(p)}
         return out
 
-    def strength(self, team: str, play_prob: dict[str, float] | None = None
-                 ) -> tuple[float | None, float]:
+    def strength(self, team: str, play_prob: dict[str, float] | None = None,
+                 roster: set[str] | None = None) -> tuple[float | None, float]:
         """
         回傳 (可出賽陣容強度, 缺陣價值占比)。
         強度＝把 200 分鐘按「預期出場時間」重新分配給能上的人，乘各自每分鐘評分。
         少一個主力，他的分鐘會流到板凳，強度自然掉下來——這正是我們要模型看見的。
+
+        roster 只有賽前預測會傳（見 pool 的說明）；歷史回填一律不傳。
         """
-        pool = self.pool(team)
+        pool = self.pool(team, roster)
         if not pool:
             return None, 0.0
         pp = play_prob or {}
@@ -306,10 +346,11 @@ class RatingBook:
         miss_share = max(0.0, 1.0 - (w_present / w_all)) if w_all > 0 else 0.0
         return strength, miss_share
 
-    def missing_players(self, team: str, play_prob: dict[str, float]) -> list[tuple]:
+    def missing_players(self, team: str, play_prob: dict[str, float],
+                        roster: set[str] | None = None) -> list[tuple]:
         """缺陣名單，按「損失的價值」排序——給前端顯示用。"""
         out = []
-        for pid in self.pool(team):
+        for pid in self.pool(team, roster):
             p = play_prob.get(pid, 1.0)
             if p >= 0.95:
                 continue
@@ -329,6 +370,7 @@ class RatingBook:
                 self._mins[pid] = self._mins[pid] * DECAY + r["minutes"]
                 self._gmsc[pid] = self._gmsc[pid] * DECAY + (r["gmsc"] or 0.0)
                 self._recent[pid].append(r["minutes"])
+                self._last_played[pid] = r["game_date"]
                 by_team[r["team_abbr"]].add(pid)
         for team, played in by_team.items():
             self._pool[team].append(played)
@@ -497,6 +539,57 @@ def live_play_prob(event_id: str, home_abbr: str, away_abbr: str) -> dict[str, f
     return merged
 
 
+def _athlete_ids(node) -> set[str]:
+    """
+    從 ESPN 回傳的任意巢狀結構撈出球員 id。
+    刻意寫成通用遞迴：ESPN 的 roster 有好幾種形狀（athletes 直接是陣列、
+    或包一層 items 分位置、或掛在 team.athletes 底下），而且會改。
+    與其賭其中一種，不如認「長得像球員的物件」，抓不到就回空集合。
+    """
+    out: set[str] = set()
+    if isinstance(node, list):
+        for x in node:
+            out |= _athlete_ids(x)
+    elif isinstance(node, dict):
+        pid = node.get("id")
+        # 有 id 又有姓名欄位，才當成球員；球隊物件也有 id，用姓名欄位排除掉
+        if pid and ("fullName" in node or "displayName" in node) and "abbreviation" not in node:
+            out.add(str(pid))
+        for k in ("athletes", "items", "entries", "team", "roster"):
+            if k in node:
+                out |= _athlete_ids(node[k])
+    return out
+
+
+def current_roster(team_abbr: str) -> set[str]:
+    """
+    ESPN 上這一隊「當下」的名冊（球員 id 集合）。抓不到就回空集合，
+    呼叫端會退回舊的「近 10 場上場過的人」定義，不會壞掉。
+    """
+    tid = ABBR_TO_ESPN_ID.get(team_abbr)
+    if not tid:
+        return set()
+    try:
+        doc = _get(f"{SITE_API}/teams/{tid}/roster")
+    except Exception:
+        try:
+            doc = _get(f"{SITE_API}/teams/{tid}?enable=roster")
+        except Exception:
+            return set()
+    ids = _athlete_ids(doc)
+    # 合理性檢查：WNBA 一隊 11~12 人。少得離譜多半是解析失敗，
+    # 多得離譜多半是撈到別的東西——兩種都寧可不用，別讓壞資料進模型。
+    return ids if 8 <= len(ids) <= 30 else set()
+
+
+def rosters_for(teams) -> dict[str, set[str]]:
+    """一次抓多隊名冊並快取；同一次排程裡每隊只打一次 ESPN。"""
+    out: dict[str, set[str]] = {}
+    for t in dict.fromkeys(teams):
+        out[t] = current_roster(t)
+    return out
+
+
 # =====================================================================
 # 四、給特徵表用的介面
 # =====================================================================
@@ -523,6 +616,13 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
            WHERE status='pending' ORDER BY game_date"""
     ).fetchall()[:max_games]
 
+    # 名冊每隊只抓一次（最多 15 隊），用來修正交易／裁員造成的名單落差。
+    # 抓不到的隊回空集合 → 那一隊自動退回「近 10 場上場過的人」。
+    try:
+        rosters = rosters_for([t for r in rows for t in (r["home_abbr"], r["away_abbr"])])
+    except Exception:
+        rosters = {}
+
     now = datetime.now(timezone.utc).isoformat()
     done = injured = 0
     for r in rows:
@@ -532,8 +632,8 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
             pp = {}
         if pp:
             injured += 1
-        hs, hm = book.strength(r["home_abbr"], pp)
-        as_, am = book.strength(r["away_abbr"], pp)
+        hs, hm = book.strength(r["home_abbr"], pp, rosters.get(r["home_abbr"]))
+        as_, am = book.strength(r["away_abbr"], pp, rosters.get(r["away_abbr"]))
         if hs is None or as_ is None:
             continue
         conn.execute(
@@ -544,4 +644,9 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
             (r["game_id"], r["game_date"], hs, as_, hm, am, now))
         done += 1
     conn.commit()
-    return {"upcoming": done, "with_injury_data": injured}
+    # roster_teams / roster_ok 是給排程日誌看的健康指標：
+    # roster_ok 若長期是 0，代表 ESPN 名冊沒抓到，交易修正等於沒作用
+    # （系統仍正常運作，只是退回舊行為）。這比靜靜失敗好。
+    return {"upcoming": done, "with_injury_data": injured,
+            "roster_teams": len(rosters),
+            "roster_ok": sum(1 for v in rosters.values() if v)}
