@@ -26,7 +26,7 @@ import sqlite3
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 RAW_BASE = ("https://raw.githubusercontent.com/sportsdataverse/wehoop-wnba-raw"
             "/main/wnba/game_rosters/json")
@@ -48,6 +48,12 @@ TEAM_MINUTES = 200.0          # 一隊一場 5 人 × 40 分鐘
 # ROSTER_ACTIVE_DAYS 是「補進來」的門檻：只認最近這麼多天在聯盟任一隊上場過的人，
 # 免得把整季沒上場的深板凳算成輪值，他們的 proj_minutes 會是過期的舊資料。
 ROSTER_ACTIVE_DAYS = 21
+
+# 放棄回補的門檻。上游 wehoop 的 game_rosters 只有 2024 年之後，
+# 2023 整季（兩百多場）永遠要不到；沒有這組規則就會每天白打兩輪 404。
+MISS_GIVEUP_ATTEMPTS = 3      # 失敗幾次之後才考慮放棄
+MISS_GIVEUP_DAYS = 14         # 比賽要過多久才算「上游不是還沒發布，是根本沒有」
+MISS_RETRY_DAYS = 30          # 放棄之後每隔多久還是回頭試一次（自癒用）
 
 # 傷兵狀態 → 出賽機率。Out 是確定的，Day-To-Day 是猜的，這個數字可以之後校準。
 PLAY_PROB = {
@@ -92,6 +98,16 @@ CREATE TABLE IF NOT EXISTS team_strength (
     home_missshare REAL,
     away_missshare REAL,
     computed_at    TEXT
+);
+
+-- 抓不到球員資料的比賽記在這裡，免得每次排程都去要同一批不存在的檔案。
+-- 上游的 game_rosters 只有 2024 年之後，2023 整季永遠要不到；
+-- 沒這張表的話那兩百多場會被無止盡地重試下去。
+CREATE TABLE IF NOT EXISTS player_sync_miss (
+    game_id   TEXT PRIMARY KEY,
+    game_date TEXT,
+    attempts  INTEGER NOT NULL DEFAULT 0,
+    last_try  TEXT
 );
 """
 
@@ -194,14 +210,54 @@ def parse_roster_json(doc: dict) -> list[dict]:
     return rows
 
 
-def history_game_ids(seasons: list[int]) -> list[str]:
-    """從賽程 parquet 取得指定賽季的所有 game_id，用來回補往年的球員資料。"""
+def history_game_ids(seasons: list[int]) -> list[tuple[str, str]]:
+    """
+    從賽程 parquet 取得要回補球員資料的比賽 (game_id, 比賽日期)。
+
+    只回「已完賽」的比賽：還沒打的比賽當然沒有 boxscore，去要它只會拿到 404。
+    打完之後它會從另一條路徑（predictions 裡 status='final'）自然進來，
+    不需要靠這裡先卡一輪失敗。
+    """
     try:
         from fetch import load_games
         df = load_games(seasons)
-        return [str(g) for g in df["game_id"].tolist()]
+        df = df[df["completed"]]
+        return [(str(gid), d.isoformat())
+                for gid, d in zip(df["game_id"], df["date"])]
     except Exception:
         return []
+
+
+def _note_miss(conn: sqlite3.Connection, gid: str, gdate: str | None):
+    """記一次「這場要不到」。同一場累積失敗次數，供 _giveup_ids 判斷何時放棄。"""
+    conn.execute(
+        """INSERT INTO player_sync_miss (game_id, game_date, attempts, last_try)
+           VALUES (?,?,1,?)
+           ON CONFLICT(game_id) DO UPDATE SET
+             attempts = player_sync_miss.attempts + 1,
+             last_try = excluded.last_try,
+             game_date = COALESCE(player_sync_miss.game_date, excluded.game_date)""",
+        (gid, gdate, datetime.now(timezone.utc).isoformat()))
+
+
+def _giveup_ids(conn: sqlite3.Connection) -> set[str]:
+    """
+    這一輪要跳過的 game_id。放棄條件是三個一起成立：
+      失敗過 MISS_GIVEUP_ATTEMPTS 次以上、比賽已經過了 MISS_GIVEUP_DAYS 天、
+      而且最近 MISS_RETRY_DAYS 天內試過了。
+
+    第二個條件保護「上游還沒來得及發布」的新比賽——那種要繼續重試。
+    第三個條件留了自癒的後路：每 MISS_RETRY_DAYS 天還是會再試一次，
+    萬一上游哪天補上 2023 的資料，系統自己會撿回來，不用改程式。
+    """
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(days=MISS_GIVEUP_DAYS)).isoformat()
+    recheck = (now - timedelta(days=MISS_RETRY_DAYS)).isoformat()
+    return {r[0] for r in conn.execute(
+        """SELECT game_id FROM player_sync_miss
+           WHERE attempts >= ? AND game_date IS NOT NULL AND game_date < ?
+             AND last_try > ?""",
+        (MISS_GIVEUP_ATTEMPTS, stale, recheck))}
 
 
 def sync_player_games(conn: sqlite3.Connection, limit: int = 300,
@@ -214,26 +270,32 @@ def sync_player_games(conn: sqlite3.Connection, limit: int = 300,
     """
     conn.executescript(PLAYER_SCHEMA)
     have = {r[0] for r in conn.execute("SELECT DISTINCT game_id FROM player_games")}
-    todo = [r[0] for r in conn.execute(
-        "SELECT game_id FROM predictions WHERE status='final' ORDER BY game_date DESC"
-    ) if r[0] not in have]
+    todo = [(r[0], r[1]) for r in conn.execute(
+        "SELECT game_id, game_date FROM predictions WHERE status='final' "
+        "ORDER BY game_date DESC") if r[0] not in have]
     if history_seasons:
-        seen = set(todo) | have
-        for gid in history_game_ids(history_seasons):
+        seen = {g for g, _ in todo} | have
+        for gid, gdate in history_game_ids(history_seasons):
             if gid not in seen:
-                todo.append(gid)
+                todo.append((gid, gdate))
                 seen.add(gid)
-    todo = todo[:max(0, limit)]
+
+    # 濾掉「已經放棄」的比賽（見 _giveup_ids）。這是 2023 那兩百多場的去處：
+    # 上游沒有就是沒有，試三次還在 404 又已經過了兩週，就別再打了。
+    skip = _giveup_ids(conn)
+    todo = [t for t in todo if t[0] not in skip][:max(0, limit)]
+    skipped = len(skip)
 
     added = missing = failed = 0
-    for gid in todo:
+    for gid, gdate in todo:
         try:
             doc = _get(f"{RAW_BASE}/{gid}.json")
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                missing += 1      # 上游還沒發布這場，下次排程再試
+                missing += 1      # 上游還沒發布這場
+                _note_miss(conn, gid, gdate)
             else:
-                failed += 1
+                failed += 1       # 連線/伺服器問題不記次，那不是「這場不存在」
             continue
         except Exception:
             failed += 1
@@ -241,7 +303,9 @@ def sync_player_games(conn: sqlite3.Connection, limit: int = 300,
         rows = parse_roster_json(doc)
         if not rows:
             missing += 1
+            _note_miss(conn, gid, gdate)
             continue
+        conn.execute("DELETE FROM player_sync_miss WHERE game_id=?", (gid,))
         conn.executemany(
             """INSERT OR REPLACE INTO player_games
                (game_id,player_id,game_date,season,team_abbr,is_home,name,starter,
@@ -251,7 +315,7 @@ def sync_player_games(conn: sqlite3.Connection, limit: int = 300,
         added += 1
     conn.commit()
     return {"added": added, "not_published": missing, "failed": failed,
-            "total_games": len(have) + added}
+            "skipped": skipped, "total_games": len(have) + added}
 
 
 # =====================================================================
@@ -603,18 +667,23 @@ def strength_map(conn: sqlite3.Connection) -> dict[str, tuple]:
 
 def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
     """
-    對還沒開賽的比賽，用「今天的評分」＋「今天的傷兵名單」算陣容強度，
-    寫進同一張 team_strength 表。比賽結束後 build_history 會用事實覆蓋掉這一列。
+    對還沒開賽的比賽算陣容強度，寫進同一張 team_strength 表。
+    比賽結束後 build_history 會用事實覆蓋掉這一列。
 
-    只處理最近 max_games 場：再遠的比賽傷兵名單沒有參考價值，
-    而且每場都要打 ESPN 一次，沒必要為三週後的比賽浪費請求。
+    分兩段處理，因為兩種資訊的成本差很多：
+      近 max_games 場 → 名冊 ＋ 今天的傷兵名單（每場要打一次 ESPN summary）
+      再遠的比賽      → 只用名冊（名冊每隊只抓一次，額外成本是零）
+
+    第二段是後來補的。原本遠端比賽整批吃中性填值 0，等於那些場次退回舊模型；
+    但「這隊現在的輪值有多強」不需要傷兵名單也算得出來，白白丟掉太可惜。
+    三週後誰會受傷本來就沒人知道，那一層缺了是誠實，不是缺陷。
     """
     conn.executescript(PLAYER_SCHEMA)
     book = current_book(conn)
     rows = conn.execute(
         """SELECT game_id, game_date, home_abbr, away_abbr FROM predictions
            WHERE status='pending' ORDER BY game_date"""
-    ).fetchall()[:max_games]
+    ).fetchall()
 
     # 名冊每隊只抓一次（最多 15 隊），用來修正交易／裁員造成的名單落差。
     # 抓不到的隊回空集合 → 那一隊自動退回「近 10 場上場過的人」。
@@ -624,14 +693,21 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
         rosters = {}
 
     now = datetime.now(timezone.utc).isoformat()
-    done = injured = 0
-    for r in rows:
-        try:
-            pp = live_play_prob(r["game_id"], r["home_abbr"], r["away_abbr"])
-        except Exception:
+    done = injured = roster_only = 0
+    near = max(0, max_games)
+    for i, r in enumerate(rows):
+        if i < near:
+            try:
+                pp = live_play_prob(r["game_id"], r["home_abbr"], r["away_abbr"])
+            except Exception:
+                pp = {}
+            if pp:
+                injured += 1
+        else:
+            # 遠端比賽不問傷兵：三週後的傷兵名單本來就沒有參考價值，
+            # 而且每場要多打一次 ESPN。名冊已經抓好了，這裡是零成本。
             pp = {}
-        if pp:
-            injured += 1
+            roster_only += 1
         hs, hm = book.strength(r["home_abbr"], pp, rosters.get(r["home_abbr"]))
         as_, am = book.strength(r["away_abbr"], pp, rosters.get(r["away_abbr"]))
         if hs is None or as_ is None:
@@ -648,5 +724,6 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
     # roster_ok 若長期是 0，代表 ESPN 名冊沒抓到，交易修正等於沒作用
     # （系統仍正常運作，只是退回舊行為）。這比靜靜失敗好。
     return {"upcoming": done, "with_injury_data": injured,
+            "roster_only": roster_only,
             "roster_teams": len(rosters),
             "roster_ok": sum(1 for v in rosters.values() if v)}
