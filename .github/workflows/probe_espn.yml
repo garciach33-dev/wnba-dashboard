@@ -1,0 +1,70 @@
+name: 探測 ESPN 端點（手動）
+
+# 只能手動觸發，沒有排程，不會自己跑、不吃任何額度。
+# 用途：site.api.espn.com 突然全部失敗時，一次問清楚「哪些主機還活著、
+# 失敗的是什麼錯」。與其猜，不如量。
+#
+# Actions 頁面 → 探測 ESPN 端點（手動）→ Run workflow。
+# 跑完點進去看 Probe 那一步的輸出，整段貼回對話即可。
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe
+        run: |
+          python - <<'PY'
+          import json, urllib.request, urllib.error, datetime, socket
+
+          UA = {"User-Agent": "Mozilla/5.0 (compatible; wnba-dashboard/1.0)"}
+          # 昨天的美東日期，拿來查已完賽的比分
+          d = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+          SITE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
+          CORE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba"
+          CDN  = "https://cdn.espn.com/core/wnba"
+
+          TARGETS = [
+              ("site  scoreboard", f"{SITE}/scoreboard?dates={d}&limit=100"),
+              ("site  roster(IND)", f"{SITE}/teams/5/roster"),
+              ("site  team?roster", f"{SITE}/teams/5?enable=roster"),
+              ("core  injuries(IND)", f"{CORE}/teams/5/injuries"),
+              ("core  events", f"{CORE}/events?dates={d}&limit=50"),
+              ("cdn   scoreboard", f"{CDN}/scoreboard?xhr=1&date={d}"),
+              ("cdn   team", f"{CDN}/team?xhr=1&team=ind"),
+          ]
+
+          print(f"探測日期參數 dates={d}   （UTC {datetime.datetime.utcnow():%Y-%m-%d %H:%M}）")
+          print(f"runner 對外 IP 反查: ", end="")
+          try:
+              print(socket.gethostbyname("site.api.espn.com"))
+          except Exception as e:
+              print(f"DNS 失敗 {e}")
+          print("-" * 72)
+
+          for name, url in TARGETS:
+              try:
+                  req = urllib.request.Request(url, headers=UA)
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      body = r.read()
+                  # 印出一點結構線索，確認不只是「有回應」而是「回的是我們要的東西」
+                  hint = ""
+                  try:
+                      doc = json.loads(body)
+                      if isinstance(doc, dict):
+                          keys = list(doc.keys())[:6]
+                          hint = f" keys={keys}"
+                          for k in ("events", "items", "athletes", "injuries"):
+                              if isinstance(doc.get(k), list):
+                                  hint += f" len({k})={len(doc[k])}"
+                  except Exception:
+                      hint = " (非 JSON)"
+                  print(f"OK    {r.status:3d}  {len(body):>8,d} bytes  {name}{hint}")
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP  {e.code:3d}  {'':>8}         {name}  {e.reason}")
+              except Exception as e:
+                  print(f"FAIL       {'':>8}         {name}  {type(e).__name__}: {e}")
+          PY
