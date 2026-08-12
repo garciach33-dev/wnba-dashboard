@@ -1,0 +1,69 @@
+name: 搶救被誤刪的下注紀錄（手動）
+
+# 一次性的搶救工具，只能手動觸發。
+#
+# 為什麼做成 workflow 而不是叫你在本機跑：這個 repo 你一直是用 GitHub 網頁在改的，
+# 沒有本機 clone 就沒有 git 歷史，而這支腳本正是要讀歷史。做成 workflow 之後
+# checkout 那一步指定 fetch-depth: 0 抓完整歷史，你只要按按鈕。
+# 順便也避開了「本機 db 比線上舊、push 上去反而蓋掉新資料」這個坑。
+#
+# 用法：Actions → 搶救被誤刪的下注紀錄（手動）→ Run workflow
+#   第一次把 apply 留在 no（試跑，只印報告不寫入），看報告沒問題
+#   再跑第二次、把 apply 改成 yes，才會真的寫入並 commit。
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "真的寫入？先用 no 試跑看報告"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+      since:
+        description: "往回找幾天的 commit"
+        default: "40"
+
+permissions:
+  contents: write
+
+# 跟每日排程共用同一個 concurrency group，避免兩邊同時改 db 撞在一起
+concurrency:
+  group: wnba-daily
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 是重點——預設只抓 1 層，那樣就沒有歷史可撈了
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Recover
+        run: |
+          if [ "${{ inputs.apply }}" = "yes" ]; then
+            python recover_bets.py --since "${{ inputs.since }}" --apply
+          else
+            python recover_bets.py --since "${{ inputs.since }}"
+          fi
+
+      - name: Commit（只有 apply=yes 才會走到這裡）
+        if: ${{ inputs.apply == 'yes' }}
+        run: |
+          rm -f data/wnba.db.bak-*        # 備份只是保險，不進 repo（一份 3MB）
+          if git diff --quiet -- data/wnba.db; then
+            echo "資料庫沒有變化，不需要 commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/wnba.db
+          git commit -m "recover pre-game snapshots deleted during upstream outage"
+          git push
