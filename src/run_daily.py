@@ -82,7 +82,8 @@ def main():
     ep = games.attrs.get("espn_patch") or {}
     if ep.get("dates_queried"):
         print(f"   上游 parquet 缺 {ep['dates_queried']} 天的比分 → 問 ESPN 補回 {ep['patched']} 場"
-              + ("" if ep["patched"] else "  ⚠ 一場都沒補到，ESPN 那邊可能也有問題"))
+              + (f"（來源 {ep.get('source')}）" if ep["patched"]
+                 else "  ⚠ 一場都沒補到，ESPN 那邊可能也有問題"))
 
     print("1.5) 更新球員資料與歷史陣容強度 ...")
     try:
@@ -137,7 +138,8 @@ def main():
         print(f"   {up['upcoming']} 場已算，其中 {up['with_injury_data']} 場拿到傷兵名單、"
               f"{up.get('roster_only', 0)} 場只用名冊（太遠，不問傷兵）")
         print(f"   當下名冊（交易修正）：{up.get('roster_ok', 0)}/{up.get('roster_teams', 0)} 隊抓到"
-              + ("" if up.get("roster_ok") else "  ⚠ 全部沒抓到 → 名單退回『近 10 場上場過的人』"))
+              + (f"（來源 {up.get('roster_source')}）" if up.get("roster_ok")
+                 else "  ⚠ 全部沒抓到 → 名單退回『近 10 場上場過的人』"))
         if up["upcoming"]:
             strength = strength_table()
             n_pred2 = generate_predictions(games, model, refresh=True, strength=strength)
