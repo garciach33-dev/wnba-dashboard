@@ -148,8 +148,11 @@ def main():
     print("5) 結算已完賽比賽 ...")
     n_settle = settle_results(games)
     n_clv = settle_market()
-    n_purge = purge_stale_pending()
-    print(f"   結算 {n_settle} 場、算 CLV/損益 {n_clv} 場，清除殘留延賽 {n_purge} 場")
+    pg = purge_stale_pending()
+    print(f"   結算 {n_settle} 場、算 CLV/損益 {n_clv} 場，清除殘留延賽 {pg['deleted']} 場")
+    if pg["protected"]:
+        print(f"   ⚠ 有 {pg['protected']} 場早就開打卻等不到比分，但已抓到盤口 → 保留不刪。"
+              f"\n     這通常代表上游賽程資料停更了；等它補上就會自動結算。")
 
     print("6) 產生儀表板 ...")
     out = build_dashboard()
