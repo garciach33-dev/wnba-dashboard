@@ -20,6 +20,10 @@ from pathlib import Path
 from db import connect
 
 OUT_PATH = Path(__file__).resolve().parent.parent / "dashboard.html"
+
+# 進場線超過開賽前這麼多小時記的，視為「太早」，CLV 不可信。
+# 要跟 market.ENTRY_MAX_HOURS 一致。
+EARLY_ENTRY_HOURS = 48
 MYBETS_CSV = Path(__file__).resolve().parent.parent / "data" / "my_bets.csv"
 TPE = timezone(timedelta(hours=8))   # 台北固定 UTC+8（無日光節約）
 
@@ -230,9 +234,20 @@ def _agg(bets, result_key, clv_key):
 def _paper_stats(settled) -> dict:
     ml = [r for r in settled if r.get("paper_ml_side") and r.get("paper_ml_result") is not None]
     tot = [r for r in settled if r.get("paper_total_side") and r.get("paper_total_result") is not None]
+    # 太早記的注：進場線是開賽好幾天前的報價，不是真的下得到的價，
+    # 拿它算出來的 CLV 會系統性偏樂觀（早期線本來就偏離真值，收盤會往真值收斂）。
+    # 這裡把數量算出來，讓儀表板明講，而不是讓那些數字混在一起看起來像 edge。
+    all_bets = {id(r): r for r in ml + tot}.values()
+    # lead <= 0 是「進場線比開賽時間還晚」——上游停更期間比賽一直掛在 pending，
+    # 盤口就對到了同兩隊兩天內的下一場，等於記到別場的價。那比太早更糟。
+    early = sum(1 for r in all_bets
+                if r.get("entry_lead_hours") is None
+                or not (0 < r["entry_lead_hours"] <= EARLY_ENTRY_HOURS))
     return {
         "ml": _agg(ml, "paper_ml_result", "clv_ml"),
         "total": _agg(tot, "paper_total_result", "clv_total"),
+        "early_entries": early,
+        "total_entries": len(all_bets),
     }
 
 
@@ -252,7 +267,9 @@ def _paper_bet_rows(settled) -> list:
                 "type": "大小分", "side": r["paper_total_side"],
                 "side_abbr": ("over" if r["paper_total_side"] == "over" else "under"),
                 "line": r.get("market_total_line"),
-                "edge": r.get("edge_total"), "result": r["paper_total_result"], "clv": r.get("clv_total"),
+                "edge": r.get("edge_total"), "result": r["paper_total_result"],
+                "clv": r.get("clv_total"), "clv_pts": r.get("clv_total_pts"),
+                "close_line": r.get("closing_total_line"),
             })
     return rows
 
@@ -664,8 +681,17 @@ if(DATA.has_market){
     const P = DATA.paper, n = P.ml.n + P.total.n;
     const clvs = [P.ml.avg_clv, P.total.avg_clv].filter(x=>x!=null);
     const avgClv = clvs.length ? clvs.reduce((a,b)=>a+b,0)/clvs.length : null;
+    const early = P.early_entries || 0, tot = P.total_entries || 0;
     let cls, html;
-    if(n < 20){
+    // 太早記的注會讓 CLV 系統性偏樂觀，所以只要大半是這種，就不准 banner 轉綠。
+    // 寧可少賺也不要把一個量錯的數字包裝成「可以下注了」。
+    if(tot && early / tot > 0.5){
+      cls = "hold";
+      html = `<b>總體建議：先全部觀望。目前的 CLV 還不能當判準。</b><br>`+
+        `${tot} 注裡有 ${early} 注的進場盤口是開賽 48 小時以前記的。那不是你真的下得到的價，`+
+        `而早期線本來就偏離真值、收盤會往真值收斂，所以只要模型大致正確，CLV 就會假性偏高。`+
+        `記注時機已經改成只在開賽前 48 小時內開倉，請等新規則下的注累積起來再看這一區。`;
+    } else if(n < 20){
       cls = "hold";
       html = `<b>總體建議：先全部觀望、不下真錢。</b><br>目前只累積了 ${n} 注，樣本太小、還無法判斷模型有沒有真 edge。`+
         `請先讓它跑，等累積到約 30 注、且下方「平均 CLV」有意義後再回來看這裡。`;
@@ -725,7 +751,10 @@ if(DATA.has_market){
     const win = b.result>0, push = b.result===0;
     const resTxt = push?"退注":(win?"+"+b.result.toFixed(2):b.result.toFixed(2));
     const resCls = push?"":(win?"ok":"no");
-    const clvTxt = b.clv==null?"—":(b.clv>=0?"+":"")+(b.clv*100).toFixed(1)+"pp";
+    // 大小分的 CLV 本質是「盤口線往你的方向走了幾分」，直接把分數寫出來比 pp 好懂
+    let clvTxt = b.clv==null?"—":(b.clv>=0?"+":"")+(b.clv*100).toFixed(1)+"pp";
+    if(b.clv!=null && b.clv_pts!=null && b.clv_pts!==0)
+      clvTxt = (b.clv_pts>=0?"+":"")+b.clv_pts.toFixed(1)+"分 ("+clvTxt+")";
     const clvCls = b.clv==null?"":(b.clv>=0?"ok":"no");
     const sideTxt = b.type==="大小分" ? (b.side==="over"?`大分 O${b.line??""}`:`小分 U${b.line??""}`) : b.side_abbr;
     return `<tr><td>${b.date.slice(5)}</td><td>${b.matchup}</td>`+
