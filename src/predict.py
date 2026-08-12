@@ -62,22 +62,44 @@ def _write_rows(subset: pd.DataFrame, preds: pd.DataFrame, backfilled: int,
     return written
 
 
-def purge_stale_pending(grace_hours: int = 12) -> int:
+def purge_stale_pending(grace_days: int = 14) -> dict:
     """
-    刪除「過去卻仍未完賽」的 pending（多半是延賽/資料缺漏，永遠不會結算）。
-    保留 grace 期讓進行中的比賽有時間被結算。回傳刪除筆數。
+    清掉「早就過了開賽時間、卻永遠等不到結算」的 pending 列。
+
+    原本這裡是 12 小時就刪，那是個會吃掉真實資料的設計。上游 wehoop 的賽程
+    parquet 一旦停更（2026 年 8 月就發生過，整整十天沒有新的完賽紀錄），
+    這些比賽在我們眼裡就是「過去了但沒完賽」，於是每天被當成延賽刪掉一批。
+    刪掉的不只是預測快照，還包含同一列上的盤口與紙上下注（market_* 與
+    paper_* 欄位都在 predictions 這張表裡）——也就是 CLV 的原始證據。
+    等上游補上資料，backfill_history 只能用 walk-forward「重建」，
+    那已經不是當初賽前真的說過什麼了。
+
+    所以現在的規則是：
+      1. 有抓到盤口的（market_captured_at 不是 NULL）—— 永遠不刪。
+         那是證據，寧可讓它一直掛在 pending 也不能弄丟。
+      2. 其餘的等 grace_days 天再刪。延賽的比賽多留兩週只是佔一點空間，
+         誤刪真實快照卻是救不回來的。
+
+    回傳 {"deleted": n, "protected": m}，m 是「本來會被舊邏輯刪掉、
+    現在保住」的筆數——這個數字長期不是 0 就代表上游又出問題了。
     """
     from datetime import timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=grace_hours)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=grace_days)).isoformat()
+    soft = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     conn = connect()
+    protected = conn.execute(
+        "SELECT COUNT(*) FROM predictions WHERE status='pending' AND backfilled=0 "
+        "AND game_date < ? AND market_captured_at IS NOT NULL", (soft,)
+    ).fetchone()[0]
     cur = conn.execute(
-        "DELETE FROM predictions WHERE status='pending' AND backfilled=0 AND game_date < ?",
+        "DELETE FROM predictions WHERE status='pending' AND backfilled=0 "
+        "AND game_date < ? AND market_captured_at IS NULL",
         (cutoff,),
     )
     conn.commit()
     n = cur.rowcount
     conn.close()
-    return n
+    return {"deleted": n, "protected": protected}
 
 
 def generate_predictions(games: pd.DataFrame, model: WNBAModel, refresh: bool = False,
