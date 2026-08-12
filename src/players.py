@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.request
@@ -625,6 +626,40 @@ def _athlete_ids(node) -> set[str]:
     return out
 
 
+def _ref_ids(node) -> set[str]:
+    """
+    core API 不直接給球員物件，只給一串 $ref 連結：
+      {"items": [{"$ref": ".../athletes/2529120?lang=en&region=us"}, ...]}
+    id 就寫在網址裡，所以不必再逐一去要，正則挖出來就好（15 隊 = 15 個請求）。
+    """
+    out: set[str] = set()
+    if isinstance(node, list):
+        for x in node:
+            out |= _ref_ids(x)
+    elif isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            m = re.search(r"/athletes/(\d+)", ref)
+            if m:
+                out.add(m.group(1))
+        for v in node.values():
+            if isinstance(v, (list, dict)):
+                out |= _ref_ids(v)
+    return out
+
+
+# 名冊來源，照順序試。2026/8/12 實測：site.api.espn.com 從 GitHub runner
+# 打過去一律 403（ESPN 對雲端機房 IP 的限流），sports.core.api.espn.com 正常。
+# 所以 core 排第一，site 那兩條留著當後路——限流解除後會自己活回來。
+ROSTER_SOURCES = [
+    ("core", "{CORE}/seasons/{year}/teams/{tid}/athletes?limit=100", _ref_ids),
+    ("site", "{SITE}/teams/{tid}/roster", _athlete_ids),
+    ("site2", "{SITE}/teams/{tid}?enable=roster", _athlete_ids),
+]
+
+LAST_ROSTER_SOURCE: dict = {"source": None}
+
+
 def current_roster(team_abbr: str) -> set[str]:
     """
     ESPN 上這一隊「當下」的名冊（球員 id 集合）。抓不到就回空集合，
@@ -633,17 +668,19 @@ def current_roster(team_abbr: str) -> set[str]:
     tid = ABBR_TO_ESPN_ID.get(team_abbr)
     if not tid:
         return set()
-    try:
-        doc = _get(f"{SITE_API}/teams/{tid}/roster")
-    except Exception:
+    year = datetime.now(timezone.utc).year
+    for name, tmpl, parse in ROSTER_SOURCES:
         try:
-            doc = _get(f"{SITE_API}/teams/{tid}?enable=roster")
+            doc = _get(tmpl.format(CORE=CORE_API, SITE=SITE_API, tid=tid, year=year))
         except Exception:
-            return set()
-    ids = _athlete_ids(doc)
-    # 合理性檢查：WNBA 一隊 11~12 人。少得離譜多半是解析失敗，
-    # 多得離譜多半是撈到別的東西——兩種都寧可不用，別讓壞資料進模型。
-    return ids if 8 <= len(ids) <= 30 else set()
+            continue
+        ids = parse(doc)
+        # 合理性檢查：WNBA 一隊 11~12 人。少得離譜多半是解析失敗，
+        # 多得離譜多半是撈到別的東西——兩種都寧可不用，別讓壞資料進模型。
+        if 8 <= len(ids) <= 30:
+            LAST_ROSTER_SOURCE["source"] = name
+            return ids
+    return set()
 
 
 def rosters_for(teams) -> dict[str, set[str]]:
@@ -726,4 +763,5 @@ def compute_upcoming(conn: sqlite3.Connection, max_games: int = 40) -> dict:
     return {"upcoming": done, "with_injury_data": injured,
             "roster_only": roster_only,
             "roster_teams": len(rosters),
-            "roster_ok": sum(1 for v in rosters.values() if v)}
+            "roster_ok": sum(1 for v in rosters.values() if v),
+            "roster_source": LAST_ROSTER_SOURCE["source"]}
