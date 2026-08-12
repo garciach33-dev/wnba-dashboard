@@ -29,10 +29,23 @@ TPE = timezone(timedelta(hours=8))   # 台北固定 UTC+8（無日光節約）
 
 
 def _taipei_date(iso: str) -> str:
+    s = (iso or "").strip()
+    # 純日期就照原樣回傳。丟進 fromisoformat 會變成「本機時區的午夜」再換算，
+    # 容器時區一改就會差一天。
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s
     try:
-        return datetime.fromisoformat(iso).astimezone(TPE).strftime("%Y-%m-%d")
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(TPE).strftime("%Y-%m-%d")
     except Exception:
-        return (iso or "")[:10]
+        return s[:10]
+
+
+def _dec_odds(o: float) -> float:
+    """十進位賠率一定 > 1。台灣習慣寫淨賠率（0.75 = 押 1 賺 0.75），補回 1。"""
+    return o if o > 1 else o + 1
 
 
 def load_mybets(conn) -> tuple[list, dict | None]:
@@ -55,13 +68,14 @@ def load_mybets(conn) -> tuple[list, dict | None]:
     with open(MYBETS_CSV, newline="", encoding="utf-8-sig") as f:
         for raw in csv.DictReader(f):
             try:
-                date = (raw.get("date") or "").strip()[:10]
+                # 跟前端同一套規則：完整時間戳要先換成台北日期，不能直接截前 10 碼
+                date = _taipei_date((raw.get("date") or "").strip())
                 away = (raw.get("away") or "").strip().upper()
                 home = (raw.get("home") or "").strip().upper()
                 market = (raw.get("market") or "").strip().upper()
                 side = (raw.get("side") or "").strip()
                 stake = float(raw.get("stake"))
-                odds = float(raw.get("odds"))
+                odds = _dec_odds(float(raw.get("odds")))
                 line = raw.get("line")
                 line = float(line) if (line not in (None, "",) ) else None
             except (TypeError, ValueError):
@@ -780,7 +794,18 @@ const GAMEIDX = {};
 (DATA.settled||[]).concat(DATA.pending||[]).forEach(g=>{
   GAMEIDX[[g.away_abbr,g.home_abbr,tpeDate(g.game_date)].join("|")] = g;
 });
-function gameOf(b){ return GAMEIDX[[String(b.away).toUpperCase(),String(b.home).toUpperCase(),String(b.date).slice(0,10)].join("|")]; }
+// 試算表回傳的日期可能是純日期字串 "2026-07-29"，也可能是 Google 幫你轉成
+// Date 之後序列化的完整時間 "2026-07-28T16:00:00.000Z"（那其實就是台北 7/29 00:00）。
+// 只截前 10 碼會得到 "2026-07-28"（差一天）甚至 "07-28T16:0"（整個對不上），
+// 這就是「無法對應」的來源。統一先換算成台北日期再比對。
+function betDate(b){
+  const s = String(b.date || "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : tpeDate(s);
+}
+// 賠率：十進位一定 > 1（1.75 = 押 1 賺 0.75）。台灣習慣寫淨賠率 0.75，
+// 直接丟進 stake*(odds-1) 會算成倒賠。<=1 一律當成淨賠率補回 1。
+function decOdds(o){ const x = +o; return (isFinite(x) && x > 1) ? x : x + 1; }
+function gameOf(b){ return GAMEIDX[[String(b.away).toUpperCase(),String(b.home).toUpperCase(),betDate(b)].join("|")]; }
 
 function targetLabel(b){
   if(String(b.market).toUpperCase()==="ML") return (String(b.side).toUpperCase()===String(b.home).toUpperCase()?b.home:b.away)+" 獨贏";
@@ -791,7 +816,7 @@ function betResult(b){
   const g=gameOf(b);
   if(!g) return {status:"無法對應", pnl:null, yw:null};
   if(g.actual_winner==null) return {status:"待開賽", pnl:null, yw:null};
-  const stake=+b.stake, odds=+b.odds;
+  const stake=+b.stake, odds=decOdds(b.odds);
   if(String(b.market).toUpperCase()==="ML"){
     const my = String(b.side).toUpperCase()===String(b.home).toUpperCase()?"home":"away";
     const yw = (my===g.actual_winner);
@@ -819,11 +844,11 @@ function modelView(b){
 }
 
 function renderMyBets(){
-  const bets=[...MYBETS].sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  const bets=[...MYBETS].sort((a,b)=>betDate(b).localeCompare(betDate(a)));
   // 卡片上已存注
   document.querySelectorAll(".mybet").forEach(el=>{
     const key=[el.dataset.away,el.dataset.home,el.dataset.date].join("|");
-    const list=bets.filter(b=>[String(b.away).toUpperCase(),String(b.home).toUpperCase(),String(b.date).slice(0,10)].join("|")===key);
+    const list=bets.filter(b=>[String(b.away).toUpperCase(),String(b.home).toUpperCase(),betDate(b)].join("|")===key);
     el.querySelector(".mybet-list").innerHTML=list.map(b=>{
       const r=betResult(b);
       const tag=r.status==="待開賽"?"":`・${r.status}${r.pnl!=null?`（${r.pnl>=0?"+":""}${r.pnl.toFixed(0)}）`:""}`;
@@ -855,7 +880,7 @@ function renderMyBets(){
       if(r.yw!=null&&mv.mw!=null) who=r.yw&&mv.mw?"都對":(!r.yw&&!mv.mw?"都錯":(r.yw?"<span class='ok'>你對 ✓</span>":"<span class='no'>模型對</span>"));
       else if(r.status==="待開賽"||r.status==="無法對應"||r.status==="缺盤口線") who=r.status;
       const agreeTag=mv.agree==null?"":(mv.agree?" <span class='seg'>同</span>":" <span class='seg'>異</span>");
-      return `<tr><td>${String(b.date).slice(5)}</td><td>${b.away}@${b.home}</td><td><b>${targetLabel(b)}</b></td>`+
+      return `<tr><td>${betDate(b).slice(5)}</td><td>${b.away}@${b.home}</td><td><b>${targetLabel(b)}</b></td>`+
         `<td class="num">${b.stake}</td><td class="num">${b.odds}</td><td>${mv.side}${agreeTag}</td>`+
         `<td>${who}</td><td class="num ${pnlCls}">${pnlTxt}</td></tr>`;
     }).join("");
