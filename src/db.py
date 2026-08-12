@@ -85,6 +85,12 @@ MARKET_COLUMNS = {
     "paper_total_side": "TEXT",   # 'over'/'under'
     "paper_total_result": "REAL",
     "clv_total": "REAL",
+    # 大小分的 CLV 主要來自「盤口線移動了幾分」，clv_total 是換算成機率的版本
+    # （才能跟獨贏的 CLV 放在一起平均），這一欄存原始的分數，比較好懂也好稽核。
+    "clv_total_pts": "REAL",
+    # 凍結進場線的當下，距離開賽還有幾小時。太早記的注 CLV 沒有參考價值，
+    # 儀表板用這一欄把它們標出來。
+    "entry_lead_hours": "REAL",
 }
 
 
