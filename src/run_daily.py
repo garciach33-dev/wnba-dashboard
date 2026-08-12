@@ -79,6 +79,10 @@ def main():
     print("1) 下載賽程與比分 ...")
     games = load_games(SEASONS, force_download=not args.no_download)
     print(f"   共 {len(games)} 場，完賽 {games['completed'].sum()}、未完賽 {(~games['completed']).sum()}")
+    ep = games.attrs.get("espn_patch") or {}
+    if ep.get("dates_queried"):
+        print(f"   上游 parquet 缺 {ep['dates_queried']} 天的比分 → 問 ESPN 補回 {ep['patched']} 場"
+              + ("" if ep["patched"] else "  ⚠ 一場都沒補到，ESPN 那邊可能也有問題"))
 
     print("1.5) 更新球員資料與歷史陣容強度 ...")
     try:
