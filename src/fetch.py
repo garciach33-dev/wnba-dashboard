@@ -33,13 +33,20 @@ RAW_BASE = (
 #
 # 這是備援不是主源：parquet 有的就用 parquet，ESPN 只補洞。
 # 任何一步失敗都靜靜跳過，讓系統退回「就是沒這場資料」，不會比原本更糟。
-ESPN_SCOREBOARD = ("https://site.api.espn.com/apis/site/v2/sports/"
-                   "basketball/wnba/scoreboard")
+# 為什麼有兩個來源：2026/8/12 實測，site.api.espn.com 從 GitHub runner
+# 打過去一律 403（ESPN 對雲端機房 IP 的限流，會來來去去），而 cdn.espn.com
+# 同一時間回 200、229KB 正常資料。所以 cdn 排第一、site 留著當後路——
+# 哪天限流解除，site 那條自己會活回來。
+ESPN_SOURCES = [
+    ("cdn", "https://cdn.espn.com/core/wnba/scoreboard?xhr=1&date={d}"),
+    ("site", "https://site.api.espn.com/apis/site/v2/sports/"
+             "basketball/wnba/scoreboard?dates={d}&limit=100"),
+]
 ESPN_LOOKBACK_DAYS = 21   # 只回補近三週；再舊的等 parquet 自己補
 ESPN_MAX_DATES = 25       # 單次最多問幾天，避免上游長期停擺時請求爆量
 ESPN_SETTLE_HOURS = 4     # 開賽後幾小時才視為「該有比分了」
 
-LAST_ESPN_PATCH: dict = {"patched": 0, "dates_queried": 0}
+LAST_ESPN_PATCH: dict = {"patched": 0, "dates_queried": 0, "source": None}
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
@@ -64,35 +71,77 @@ def download_season(season: int, force: bool = False) -> Path:
     return dest
 
 
-def _espn_scores_for_date(daystr: str) -> dict[str, tuple[int, int]]:
-    """問 ESPN 某一天的比分，回傳 {game_id: (主隊得分, 客隊得分)}，只收已完賽的。"""
-    url = f"{ESPN_SCOREBOARD}?dates={daystr}&limit=100"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        doc = json.load(resp)
+def _score_of(node) -> int | None:
+    """比分在不同來源長得不一樣：可能是 "88"、88、或 {"displayValue": "88"}。"""
+    if isinstance(node, dict):
+        node = node.get("displayValue", node.get("value"))
+    try:
+        return int(float(node))
+    except (TypeError, ValueError):
+        return None
 
-    out: dict[str, tuple[int, int]] = {}
-    for ev in doc.get("events") or []:
-        gid = str(ev.get("id") or "")
-        if not gid:
-            continue
-        for comp in ev.get("competitions") or []:
+
+def _collect_events(node, out: dict[str, tuple[int, int]]) -> None:
+    """
+    在任意巢狀結構裡找出「比賽」節點並抓比分。
+
+    刻意不寫死路徑（site.api 是 doc["events"]，cdn 埋在 content.sbData 底下），
+    因為 ESPN 改結構是常態。認得出「有 id 又有 competitions」就當成一場比賽，
+    比記路徑穩得多。
+    """
+    if isinstance(node, list):
+        for x in node:
+            _collect_events(x, out)
+        return
+    if not isinstance(node, dict):
+        return
+
+    gid = str(node.get("id") or "")
+    comps = node.get("competitions")
+    if gid and isinstance(comps, list):
+        for comp in comps:
+            if not isinstance(comp, dict):
+                continue
             status = (comp.get("status") or {}).get("type") or {}
             if not status.get("completed"):
                 continue          # 進行中、延賽、取消 —— 一律不收
             home = away = None
             for c in comp.get("competitors") or []:
-                try:
-                    score = int(float(c.get("score")))
-                except (TypeError, ValueError):
+                if not isinstance(c, dict):
+                    continue
+                s = _score_of(c.get("score"))
+                if s is None:
                     continue
                 if c.get("homeAway") == "home":
-                    home = score
+                    home = s
                 elif c.get("homeAway") == "away":
-                    away = score
+                    away = s
             if home is not None and away is not None:
                 out[gid] = (home, away)
-    return out
+
+    for v in node.values():
+        if isinstance(v, (list, dict)):
+            _collect_events(v, out)
+
+
+def _espn_scores_for_date(daystr: str) -> tuple[dict[str, tuple[int, int]], str | None]:
+    """
+    問某一天的比分，回傳 ({game_id: (主隊得分, 客隊得分)}, 用了哪個來源)。
+    照 ESPN_SOURCES 的順序試，第一個「有回應且解得出比賽」的就採用。
+    """
+    for name, tmpl in ESPN_SOURCES:
+        try:
+            req = urllib.request.Request(tmpl.format(d=daystr),
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                doc = json.load(resp)
+        except Exception:
+            continue
+        out: dict[str, tuple[int, int]] = {}
+        _collect_events(doc, out)
+        if out:
+            return out, name
+    return {}, None
 
 
 def patch_missing_scores(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
@@ -113,11 +162,15 @@ def patch_missing_scores(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
     days = days[-ESPN_MAX_DATES:]      # 留最近的幾天，舊的優先讓 parquet 去補
 
     found: dict[str, tuple[int, int]] = {}
+    source = None
     for d in days:
         try:
-            found.update(_espn_scores_for_date(d))
+            got, src = _espn_scores_for_date(d)
         except Exception:
             continue                   # 某一天失敗就跳過，其他天照補
+        found.update(got)
+        source = source or src
+    LAST_ESPN_PATCH["source"] = source
 
     patched = 0
     for i in stale.index:
@@ -169,6 +222,7 @@ def load_games(seasons: list[int], force_download: bool = False,
 
     # 上游停更時的備援：拿 ESPN 的比分補上 parquet 缺的那幾天
     patched = dates_q = 0
+    LAST_ESPN_PATCH["source"] = None
     if espn_fallback:
         try:
             df, patched, dates_q = patch_missing_scores(df)
