@@ -16,10 +16,10 @@ name: WNBA 每日預測與部署
 # 分鐘刻意設 17 不設 0：整點是全 GitHub 最壅塞的一分鐘，排隊排前面一點。
 # 即使如此，排程延遲十幾分鐘到一小時仍屬常態，必要時到 Actions 頁面手動觸發。
 on:
-  schedule:
-    - cron: "17 21 * * *"
-    - cron: "17 23 * * *"
-    - cron: "17 11 * * *"
+  # schedule:
+#     - cron: "17 21 * * *"
+    # - cron: "17 23 * * *"
+    # - cron: "17 11 * * *"
   workflow_dispatch: {}   # 也可在 Actions 頁面手動觸發
 
 permissions:
